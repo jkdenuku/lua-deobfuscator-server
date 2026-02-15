@@ -1,6 +1,0 @@
-services:
-  - type: web
-    name: lua-deobfuscator
-    env: docker
-    dockerfilePath: ./Dockerfile
-    plan: free
