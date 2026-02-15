@@ -54,9 +54,8 @@ button.copy-btn:hover{background:#d32f2f}
 <h1>🔓 Lua解読ツール<span class="badge">動的実行</span></h1>
 <div class="info">
 ✨ WeAreDevs、YAJU、その他の難読化に対応<br>
-🚀 サーバー側で実際にLuaコードを実行してloadstring()をキャプチャ<br>
-📁 ファイルアップロード対応（.lua / .txt）<br>
-💡 全てのLuaコード（print以外も）に対応
+🚀 サーバー側で実際にLuaコードを実行して元のコードをキャプチャ<br>
+📁 ファイルアップロード対応（.lua / .txt）
 </div>
 
 <div class="control-group">
@@ -64,7 +63,7 @@ button.copy-btn:hover{background:#d32f2f}
 <label for="fileInput" class="file-btn">📂 ファイルを選択 (.lua / .txt)</label>
 <input type="file" id="fileInput" accept=".lua,.txt">
 <div id="fileNameDisplay" class="file-name">ファイル未選択</div>
-<textarea id="input" placeholder="難読化されたLuaコードをここに貼り付け、またはファイルを選択..."></textarea>
+<textarea id="input" placeholder="難読化されたLuaコードをここに貼り付け..."></textarea>
 </div>
 
 <button class="main-btn" onclick="deobfuscate()">🔓 解読を実行</button>
@@ -79,7 +78,6 @@ button.copy-btn:hover{background:#d32f2f}
 </div>
 
 <script>
-// ファイル読み込み
 document.getElementById('fileInput').addEventListener('change', function(e){
 const file = e.target.files[0];
 if(!file) return;
@@ -157,162 +155,92 @@ app.post('/api/deobfuscate', async (req, res) => {
     return res.json({ success: false, error: 'コードが提供されていません' });
   }
 
-  // 方法1: 動的実行（loadstringキャプチャ）
-  const dynamicResult = await tryDynamicExecution(code);
-  if (dynamicResult.success) {
-    return res.json(dynamicResult);
-  }
-
-  // 方法2: 静的解析（WeAreDevs形式）
-  const staticResult = tryStaticAnalysis(code);
-  if (staticResult.success) {
-    return res.json(staticResult);
-  }
-
-  // 失敗
-  res.json({
-    success: false,
-    error: '解読に失敗しました。対応していない形式の可能性があります。'
-  });
+  // 動的実行で解読
+  const result = await tryDynamicExecution(code);
+  res.json(result);
 });
 
-// 動的実行（loadstringキャプチャ）
+// 動的実行
 async function tryDynamicExecution(code) {
   const timestamp = Date.now();
   const randomId = Math.random().toString(36).substring(7);
   const tempFile = path.join(tempDir, `obf_${timestamp}_${randomId}.lua`);
 
-  // loadstringをフックして元のコードをキャプチャ
+  // 難読化コードをそのまま実行してloadstringをキャプチャ
   const wrapper = `
+-- loadstringをフック
 local captured_code = nil
 local original_loadstring = loadstring or load
 
--- loadstringをフック
-_G.loadstring = function(str, ...)
-  captured_code = str
-  return original_loadstring(str, ...)
+_G.loadstring = function(code_str, ...)
+  if type(code_str) == "string" and #code_str > 10 then
+    captured_code = code_str
+  end
+  return original_loadstring(code_str, ...)
 end
 
-_G.load = function(str, ...)
-  if type(str) == "string" then
-    captured_code = str
-  end
-  return original_loadstring(str, ...)
-end
+_G.load = _G.loadstring
 
 -- 難読化コードを実行
-local success, err = pcall(function()
-${code}
+local success, result = pcall(function()
+  ${code}
 end)
 
--- キャプチャしたコードを出力
+-- 結果を出力
 if captured_code then
-  print("__CAPTURED_CODE_START__")
-  print(captured_code)
-  print("__CAPTURED_CODE_END__")
+  io.write("__CAPTURED_START__")
+  io.write(captured_code)
+  io.write("__CAPTURED_END__")
+elseif success and type(result) == "function" then
+  -- 関数が返された場合、実行してみる
+  local success2, result2 = pcall(result)
+  if captured_code then
+    io.write("__CAPTURED_START__")
+    io.write(captured_code)
+    io.write("__CAPTURED_END__")
+  else
+    io.write("__NO_CAPTURE__")
+  end
 else
-  print("__NO_CODE_CAPTURED__")
-end
-
-if not success then
-  print("__ERROR__: " .. tostring(err))
+  io.write("__NO_CAPTURE__")
+  if not success then
+    io.write("__ERROR__:")
+    io.write(tostring(result))
+  end
 end
 `;
 
   return new Promise((resolve) => {
     fs.writeFileSync(tempFile, wrapper, 'utf8');
 
-    exec(`lua ${tempFile}`, { timeout: 10000 }, (error, stdout, stderr) => {
+    exec(`lua ${tempFile}`, { timeout: 15000, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
       try { fs.unlinkSync(tempFile); } catch (e) {}
 
-      if (error) {
-        return resolve({ success: false, error: stderr || error.message });
+      if (error && !stdout.includes('__CAPTURED_START__')) {
+        return resolve({ 
+          success: false, 
+          error: '実行エラー: ' + (stderr || error.message)
+        });
+      }
+
+      if (stdout.includes('__CAPTURED_START__') && stdout.includes('__CAPTURED_END__')) {
+        const start = stdout.indexOf('__CAPTURED_START__') + '__CAPTURED_START__'.length;
+        const end = stdout.indexOf('__CAPTURED_END__');
+        const captured = stdout.substring(start, end);
+        
+        if (captured && captured.length > 5) {
+          return resolve({ success: true, result: captured });
+        }
       }
 
       if (stdout.includes('__ERROR__:')) {
-        const errorMsg = stdout.split('__ERROR__:')[1].trim();
-        return resolve({ success: false, error: 'Lua実行エラー: ' + errorMsg });
+        const errMsg = stdout.split('__ERROR__:')[1];
+        return resolve({ success: false, error: 'Luaエラー: ' + errMsg });
       }
 
-      if (stdout.includes('__NO_CODE_CAPTURED__')) {
-        return resolve({ success: false, error: 'loadstringが検出されませんでした' });
-      }
-
-      // キャプチャしたコードを抽出
-      if (stdout.includes('__CAPTURED_CODE_START__') && stdout.includes('__CAPTURED_CODE_END__')) {
-        const startIdx = stdout.indexOf('__CAPTURED_CODE_START__') + '__CAPTURED_CODE_START__'.length;
-        const endIdx = stdout.indexOf('__CAPTURED_CODE_END__');
-        const capturedCode = stdout.substring(startIdx, endIdx).trim();
-        
-        if (capturedCode && capturedCode.length > 0) {
-          resolve({ success: true, result: capturedCode });
-        } else {
-          resolve({ success: false, error: 'コードが空です' });
-        }
-      } else {
-        resolve({ success: false, error: 'コードの抽出に失敗しました' });
-      }
+      resolve({ success: false, error: '解読に失敗しました。loadstring()が呼ばれていない可能性があります。' });
     });
   });
-}
-
-// 静的解析（WeAreDevs）
-function tryStaticAnalysis(code) {
-  try {
-    const match = code.match(/local o=\{([\s\S]+?)\}(?:local function|do\s)/);
-    if (!match) return { success: false };
-
-    const tableContent = match[1];
-    const strings = [];
-    const regex = /"((?:[^"\\]|\\.)*)"/g;
-    let m;
-
-    while ((m = regex.exec(tableContent)) !== null) {
-      const raw = m[1];
-      let decoded = '';
-      let i = 0;
-
-      while (i < raw.length) {
-        if (raw[i] === '\\' && i + 3 < raw.length) {
-          const oct = raw.substring(i + 1, i + 4);
-          if (/^\d{3}$/.test(oct)) {
-            decoded += String.fromCharCode(parseInt(oct, 8));
-            i += 4;
-            continue;
-          }
-        }
-        decoded += raw[i];
-        i++;
-      }
-
-      strings.push(decoded);
-    }
-
-    // Luaコードを含む文字列を探す
-    let best = '';
-    let bestScore = 0;
-
-    for (const str of strings) {
-      let score = 0;
-      if (str.includes('print')) score += 1000;
-      if (str.includes('local')) score += 100;
-      if (str.includes('function')) score += 50;
-      score += str.length;
-
-      if (score > bestScore) {
-        bestScore = score;
-        best = str;
-      }
-    }
-
-    if (best && bestScore > 100) {
-      return { success: true, result: best };
-    }
-
-    return { success: false };
-  } catch (e) {
-    return { success: false };
-  }
 }
 
 // クリーンアップ
