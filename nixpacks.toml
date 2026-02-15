@@ -1,8 +1,0 @@
-[phases.setup]
-aptPkgs = ['lua5.4']
-
-[phases.install]
-cmds = ['npm install']
-
-[start]
-cmd = 'node server.js'
