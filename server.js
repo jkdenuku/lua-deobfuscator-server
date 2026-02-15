@@ -212,7 +212,7 @@ function tryStaticAnalysis(code) {
 
     const tableContent = match[1];
     const strings = [];
-    const regex = /"((?:[^"\\\\]|\\\\.)*)"/g;
+    const regex = /"((?:[^"\\]|\\.)*)"/g;
     let m;
 
     while ((m = regex.exec(tableContent)) !== null) {
@@ -221,9 +221,9 @@ function tryStaticAnalysis(code) {
       let i = 0;
 
       while (i < raw.length) {
-        if (raw[i] === '\\\\' && i + 3 < raw.length) {
+        if (raw[i] === '\\' && i + 3 < raw.length) {
           const oct = raw.substring(i + 1, i + 4);
-          if (/^\\d{3}$/.test(oct)) {
+          if (/^\d{3}$/.test(oct)) {
             decoded += String.fromCharCode(parseInt(oct, 8));
             i += 4;
             continue;
@@ -281,5 +281,5 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 app.listen(PORT, () => {
-  console.log(\`Server running on port \${PORT}\`);
+  console.log(`Server running on port ${PORT}`);
 });
