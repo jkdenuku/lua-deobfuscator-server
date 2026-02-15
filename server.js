@@ -181,9 +181,19 @@ end
 
 _G.load = _G.loadstring
 
--- 難読化コードを実行
+-- 難読化コードを文字列として読み込み
+local obfuscated_code = [[
+${code}
+]]
+
+-- 実行
 local success, result = pcall(function()
-  ${code}
+  local chunk, err = loadstring(obfuscated_code)
+  if not chunk then
+    error("Failed to load: " .. tostring(err))
+  end
+  local ret = chunk()
+  return ret
 end)
 
 -- 結果を出力
