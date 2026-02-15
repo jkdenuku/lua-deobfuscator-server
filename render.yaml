@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: lua-deobfuscator
+    env: node
+    buildCommand: |
+      apt-get update
+      apt-get install -y lua5.4
+      npm install
+    startCommand: node server.js
+    plan: free
