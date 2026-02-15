@@ -28,39 +28,72 @@ app.get('/', (req, res) => {
 <style>
 :root{--bg:#0a0a0a;--panel:#141414;--primary:#4db6ac;--text:#e0e0e0}
 body{font-family:'Meiryo',sans-serif;background:var(--bg);color:var(--text);margin:0;padding:20px;display:flex;justify-content:center;align-items:center;min-height:100vh}
-.container{width:100%;max-width:800px;background:var(--panel);padding:30px;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.8);border:1px solid #333}
+.container{width:100%;max-width:850px;background:var(--panel);padding:30px;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.8);border:1px solid #333}
 h1{color:var(--primary);text-align:center;margin-top:0;text-shadow:0 0 10px rgba(77,182,172,.5)}
 .info{background:rgba(77,182,172,.1);border-left:4px solid var(--primary);padding:12px;margin:15px 0;border-radius:4px;font-size:.9em}
-textarea{width:100%;height:200px;background:#080808;color:#2ecc71;border:1px solid #333;border-radius:6px;font-family:'Consolas',monospace;padding:15px;box-sizing:border-box;resize:vertical;font-size:14px;margin:10px 0}
-button{background:linear-gradient(135deg,var(--primary),#26a69a);color:#fff;border:none;padding:18px;font-size:18px;font-weight:bold;border-radius:8px;cursor:pointer;width:100%;margin:10px 0;box-shadow:0 4px 15px rgba(77,182,172,.4);transition:.3s}
-button:hover{transform:translateY(-3px);box-shadow:0 6px 20px rgba(77,182,172,.6)}
-button:disabled{background:#555;cursor:not-allowed;transform:none}
+.control-group{margin-bottom:20px;padding:20px;background:rgba(255,255,255,.03);border-radius:8px;border:1px solid #2a2a2a}
+label{display:block;margin-bottom:10px;font-weight:bold;color:var(--primary)}
+input[type="file"]{display:none}
+.file-btn{display:inline-block;background:#222;color:#eee;padding:12px 20px;border-radius:6px;cursor:pointer;border:2px dashed #555;transition:.3s;text-align:center;width:100%;box-sizing:border-box;font-weight:bold;margin-bottom:10px}
+.file-btn:hover{background:#333;border-color:var(--primary);color:var(--primary)}
+.file-name{font-size:.9em;color:#888;text-align:right;margin-top:5px}
+textarea{width:100%;height:200px;background:#080808;color:#2ecc71;border:1px solid #333;border-radius:6px;font-family:'Consolas',monospace;padding:15px;box-sizing:border-box;resize:vertical;font-size:14px}
+button.main-btn{background:linear-gradient(135deg,var(--primary),#26a69a);color:#fff;border:none;padding:18px;font-size:18px;font-weight:bold;border-radius:8px;cursor:pointer;width:100%;margin:15px 0;box-shadow:0 4px 15px rgba(77,182,172,.4);transition:.3s;text-transform:uppercase}
+button.main-btn:hover{transform:translateY(-3px);box-shadow:0 6px 20px rgba(77,182,172,.6)}
+button.main-btn:disabled{background:#555;cursor:not-allowed;transform:none}
+button.copy-btn{background:var(--secondary);color:#fff;border:none;padding:12px;font-weight:bold;border-radius:6px;cursor:pointer;width:100%;margin-top:10px;transition:.2s;background:#ff5252}
+button.copy-btn:hover{background:#d32f2f}
 .status{text-align:center;margin:10px 0;font-weight:bold;min-height:24px}
 .loader{border:3px solid #333;border-top:3px solid var(--primary);border-radius:50%;width:30px;height:30px;animation:spin 1s linear infinite;margin:10px auto;display:none}
 @keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
+.badge{display:inline-block;background:rgba(77,182,172,.2);color:var(--primary);padding:4px 12px;border-radius:12px;font-size:.8em;font-weight:bold;margin-left:10px}
 </style>
 </head>
 <body>
 <div class="container">
-<h1>🔓 Lua解読ツール</h1>
+<h1>🔓 Lua解読ツール<span class="badge">動的実行</span></h1>
 <div class="info">
 ✨ WeAreDevs、YAJU、その他の難読化に対応<br>
-🚀 サーバー側で動的実行＋静的解析
+🚀 サーバー側で実際にLuaコードを実行してprint()の出力をキャプチャ<br>
+📁 ファイルアップロード対応（.lua / .txt）
 </div>
 
-<label style="font-weight:bold;color:var(--primary)">難読化されたコード：</label>
-<textarea id="input" placeholder="難読化されたLuaコードをここに貼り付け..."></textarea>
+<div class="control-group">
+<label>1. 難読化されたコードを入力</label>
+<label for="fileInput" class="file-btn">📂 ファイルを選択 (.lua / .txt)</label>
+<input type="file" id="fileInput" accept=".lua,.txt">
+<div id="fileNameDisplay" class="file-name">ファイル未選択</div>
+<textarea id="input" placeholder="難読化されたLuaコードをここに貼り付け、またはファイルを選択..."></textarea>
+</div>
 
-<button onclick="deobfuscate()">🔓 解読を実行</button>
+<button class="main-btn" onclick="deobfuscate()">🔓 解読を実行</button>
 <div class="loader" id="loader"></div>
 <div class="status" id="status"></div>
 
-<label style="font-weight:bold;color:var(--primary)">解読結果：</label>
+<div class="control-group">
+<label>2. 解読結果</label>
 <textarea id="output" readonly placeholder="ここに結果が表示されます..."></textarea>
-<button onclick="copy()">📋 コピー</button>
+<button class="copy-btn" onclick="copy()">📋 クリップボードにコピー</button>
+</div>
 </div>
 
 <script>
+// ファイル読み込み
+document.getElementById('fileInput').addEventListener('change', function(e){
+const file = e.target.files[0];
+if(!file) return;
+document.getElementById('fileNameDisplay').textContent = \`選択中: \${file.name} (\${(file.size/1024).toFixed(1)} KB)\`;
+const reader = new FileReader();
+reader.onload = function(e){
+document.getElementById('input').value = e.target.result;
+showStatus('ファイルを読み込みました','success');
+};
+reader.onerror = function(){
+showStatus('ファイルの読み込みに失敗しました','error');
+};
+reader.readAsText(file);
+});
+
 async function deobfuscate(){
 const input=document.getElementById('input').value;
 if(!input.trim()){
@@ -71,7 +104,7 @@ return;
 const btn=event.target;
 btn.disabled=true;
 document.getElementById('loader').style.display='block';
-showStatus('解読中...','process');
+showStatus('サーバーでLuaコードを実行中...','process');
 
 try{
 const res=await fetch('/api/deobfuscate',{
@@ -87,7 +120,7 @@ document.getElementById('output').value=data.result;
 showStatus('✅ 解読完了！','success');
 }else{
 document.getElementById('output').value='エラー:\\n'+data.error;
-showStatus('❌ エラー','error');
+showStatus('❌ '+data.error,'error');
 }
 }catch(e){
 showStatus('❌ サーバーエラー: '+e.message,'error');
