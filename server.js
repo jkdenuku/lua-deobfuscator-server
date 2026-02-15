@@ -54,8 +54,9 @@ button.copy-btn:hover{background:#d32f2f}
 <h1>🔓 Lua解読ツール<span class="badge">動的実行</span></h1>
 <div class="info">
 ✨ WeAreDevs、YAJU、その他の難読化に対応<br>
-🚀 サーバー側で実際にLuaコードを実行してprint()の出力をキャプチャ<br>
-📁 ファイルアップロード対応（.lua / .txt）
+🚀 サーバー側で実際にLuaコードを実行してloadstring()をキャプチャ<br>
+📁 ファイルアップロード対応（.lua / .txt）<br>
+💡 全てのLuaコード（print以外も）に対応
 </div>
 
 <div class="control-group">
@@ -156,7 +157,7 @@ app.post('/api/deobfuscate', async (req, res) => {
     return res.json({ success: false, error: 'コードが提供されていません' });
   }
 
-  // 方法1: 動的実行を試す
+  // 方法1: 動的実行（loadstringキャプチャ）
   const dynamicResult = await tryDynamicExecution(code);
   if (dynamicResult.success) {
     return res.json(dynamicResult);
@@ -175,49 +176,53 @@ app.post('/api/deobfuscate', async (req, res) => {
   });
 });
 
-// 動的実行
+// 動的実行（loadstringキャプチャ）
 async function tryDynamicExecution(code) {
   const timestamp = Date.now();
   const randomId = Math.random().toString(36).substring(7);
   const tempFile = path.join(tempDir, `obf_${timestamp}_${randomId}.lua`);
 
-  // コードをそのまま実行（vararg問題を回避）
+  // loadstringをフックして元のコードをキャプチャ
   const wrapper = `
-local captured_output = {}
-local original_print = print
+local captured_code = nil
+local original_loadstring = loadstring or load
 
-_G.print = function(...)
-  local args = {...}
-  local line = {}
-  for i = 1, select('#', ...) do
-    table.insert(line, tostring(select(i, ...)))
-  end
-  table.insert(captured_output, table.concat(line, "\\t"))
+-- loadstringをフック
+_G.loadstring = function(str, ...)
+  captured_code = str
+  return original_loadstring(str, ...)
 end
 
--- 実行
+_G.load = function(str, ...)
+  if type(str) == "string" then
+    captured_code = str
+  end
+  return original_loadstring(str, ...)
+end
+
+-- 難読化コードを実行
 local success, err = pcall(function()
-  ${code}
+${code}
 end)
 
--- 出力
-if #captured_output > 0 then
-  for _, line in ipairs(captured_output) do
-    original_print(line)
-  end
+-- キャプチャしたコードを出力
+if captured_code then
+  print("__CAPTURED_CODE_START__")
+  print(captured_code)
+  print("__CAPTURED_CODE_END__")
 else
-  original_print("__NO_OUTPUT__")
+  print("__NO_CODE_CAPTURED__")
 end
 
 if not success then
-  original_print("__ERROR__: " .. tostring(err))
+  print("__ERROR__: " .. tostring(err))
 end
 `;
 
   return new Promise((resolve) => {
     fs.writeFileSync(tempFile, wrapper, 'utf8');
 
-    exec(`lua ${tempFile}`, { timeout: 5000 }, (error, stdout, stderr) => {
+    exec(`lua ${tempFile}`, { timeout: 10000 }, (error, stdout, stderr) => {
       try { fs.unlinkSync(tempFile); } catch (e) {}
 
       if (error) {
@@ -225,14 +230,28 @@ end
       }
 
       if (stdout.includes('__ERROR__:')) {
-        return resolve({ success: false, error: '実行エラー' });
+        const errorMsg = stdout.split('__ERROR__:')[1].trim();
+        return resolve({ success: false, error: 'Lua実行エラー: ' + errorMsg });
       }
 
-      if (stdout.includes('__NO_OUTPUT__')) {
-        return resolve({ success: false, error: '出力なし' });
+      if (stdout.includes('__NO_CODE_CAPTURED__')) {
+        return resolve({ success: false, error: 'loadstringが検出されませんでした' });
       }
 
-      resolve({ success: true, result: stdout.trim() });
+      // キャプチャしたコードを抽出
+      if (stdout.includes('__CAPTURED_CODE_START__') && stdout.includes('__CAPTURED_CODE_END__')) {
+        const startIdx = stdout.indexOf('__CAPTURED_CODE_START__') + '__CAPTURED_CODE_START__'.length;
+        const endIdx = stdout.indexOf('__CAPTURED_CODE_END__');
+        const capturedCode = stdout.substring(startIdx, endIdx).trim();
+        
+        if (capturedCode && capturedCode.length > 0) {
+          resolve({ success: true, result: capturedCode });
+        } else {
+          resolve({ success: false, error: 'コードが空です' });
+        }
+      } else {
+        resolve({ success: false, error: 'コードの抽出に失敗しました' });
+      }
     });
   });
 }
