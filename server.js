@@ -154,6 +154,9 @@ small.hint{display:block;color:var(--muted);font-size:.78em;margin-top:5px}
         <label class="chk-label"><input type="checkbox" id="chkShuffle" checked>シャッフル</label>
         <label class="chk-label"><input type="checkbox" id="chkFlat" checked>制御フロー平坦化</label>
         <label class="chk-label" style="color:var(--obf-primary)"><input type="checkbox" id="chkAntiDump" checked>アンチダンパー</label>
+        <label class="chk-label" style="color:#ff9800"><input type="checkbox" id="chkDecimalStr" checked>文字列→10進数変換</label>
+        <label class="chk-label" style="color:#ff9800"><input type="checkbox" id="chkNumExpr" checked>数値→数式偽装</label>
+        <label class="chk-label" style="color:#ff9800"><input type="checkbox" id="chkJunkFunc" checked>ゴミ関数注入</label>
         <label class="chk-label" style="color:var(--deobf-primary)"><input type="checkbox" id="chkLite">軽量化モード</label>
       </div>
       <div id="liteModeInfo" style="display:none;margin-top:10px;font-size:.82em;color:#80deea;padding:8px 12px;background:rgba(0,229,255,.07);border-left:3px solid var(--deobf-primary);border-radius:4px">軽量化モード: ファイルサイズを自動的に小さくします</div>
@@ -232,39 +235,135 @@ function randomString(n){
 }
 function generateVarName(lite){
   if(lite){const t="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";return t[Math.floor(Math.random()*t.length)];}
-  const t=["I","l","O","_"];let e=t[Math.floor(Math.random()*t.length)];
-  for(let a=0;a<7+Math.floor(5*Math.random());a++)e+=t[Math.floor(Math.random()*t.length)];
-  return e+=randomString(3),e;
+  // ホモグリフ: I・l・O・0・1・_ を混在させて見た目で完全に区別不能にする
+  const starts=["I","l","O","Il","lI","OI","IO","lO","Ol","IlO","lIO"];
+  let e=starts[Math.floor(Math.random()*starts.length)];
+  const chars=["I","l","O","_","1","0","Il","lI","OI","IO"];
+  const len=12+Math.floor(10*Math.random());
+  for(let a=0;a<len;a++)e+=chars[Math.floor(Math.random()*chars.length)];
+  return e;
 }
 function strToChar(str){let c=[];for(let i=0;i<str.length;i++)c.push(str.charCodeAt(i));return \`string.char(\${c.join(',')})\`;}
 function bytesToBase64(t){return btoa(Array.from(t,t=>String.fromCodePoint(t)).join(""));}
+
+// ── 新強化機能 ────────────────────────────────────────────────────
+
+// 文字列を string.char(10進数...) に完全変換
+function strToDecimalChar(str){
+  const codes=[];
+  for(let i=0;i<str.length;i++)codes.push(str.charCodeAt(i));
+  return \`string.char(\${codes.join(',')})\`;
+}
+
+// 数値を数式に偽装 例: 42 → (6*7) or (math.floor(85/2)) etc.
+function numToExpr(n){
+  const r=Math.random();
+  if(r<0.25&&n>1){
+    // 積に分解
+    for(let a=2;a<=Math.min(20,n);a++){
+      if(n%a===0)return \`(\${a}*\${n/a})\`;
+    }
+  }
+  if(r<0.5){
+    // 加算
+    const offset=Math.floor(Math.random()*50)+1;
+    return \`(\${n+offset}-\${offset})\`;
+  }
+  if(r<0.75){
+    // math.floor
+    return \`(math.floor(\${(n*10).toFixed(0)}/10))\`;
+  }
+  // XOR
+  const x=Math.floor(Math.random()*255)+1;
+  return \`(bit32 and bit32.bxor(\${n^x},\${x}) or \${n})\`;
+}
+
+// 文字列を複数チャンクに分割して .. 連結で組み立て
+function strToConcat(str, lite){
+  if(str.length<=8||lite)return \`"\${str}"\`;
+  const parts=[];
+  let i=0;
+  while(i<str.length){
+    const len=3+Math.floor(Math.random()*8);
+    parts.push(\`"\${str.slice(i,i+len)}"\`);
+    i+=len;
+  }
+  return parts.join('..');
+}
+
+// ゴミ関数（呼ばれないが構文的に正しい複雑な関数）を生成
+function generateJunkFunction(lite){
+  const fn=generateVarName(lite);
+  const a=generateVarName(lite),b=generateVarName(lite),c=generateVarName(lite);
+  const patterns=[
+    \`local function \${fn}(\${a},\${b})local \${c}=0;for i=1,\${numToExpr(Math.floor(Math.random()*10)+1)} do \${c}=\${c}+\${a}*i end;return \${c}+\${b} end\`,
+    \`local function \${fn}(\${a})local \${b}={};for i=1,#\${a} do \${b}[i]=string.byte(\${a},i)+\${numToExpr(Math.floor(Math.random()*10)+1)} end;return table.concat(\${b},",") end\`,
+    \`local function \${fn}(\${a},\${b},\${c})if \${a}>\${b} then return \${a}-\${c} elseif \${b}>\${c} then return \${b}*2 else return \${c} end end\`,
+    \`local \${fn};do local \${a}=\${numToExpr(Math.floor(Math.random()*100)+1)};local \${b}=\${numToExpr(Math.floor(Math.random()*100)+1)};\${fn}=function()return \${a}+\${b} end end\`,
+  ];
+  return patterns[Math.floor(Math.random()*patterns.length)]+(lite?';':';\n');
+}
+
+// 数値リテラルを数式で偽装しながらダミー変数を生成
+function generateNumericJunk(lite){
+  const v=generateVarName(lite);
+  const n=Math.floor(Math.random()*1000)+1;
+  return \`local \${v}=\${numToExpr(n)};\${lite?'':'\\n'}\`;
+}
 function generateMassiveJunkCode(count,lite){
   let e="";
   const a=[
+    // 既存パターン
     ()=>\`local \${generateVarName(lite)}=\${Math.floor(1e4*Math.random())};\${lite?'':'\\n'}\`,
     ()=>\`local \${generateVarName(lite)}="\${randomString(lite?10:20)}";\${lite?'':'\\n'}\`,
     ()=>\`local \${generateVarName(lite)}=function()return \${Math.random()}end;\${lite?'':'\\n'}\`,
     ()=>\`local \${generateVarName(lite)}={\${Array.from({length:lite?3:5},()=>Math.random()).join(",")}};\${lite?'':'\\n'}\`,
     ()=>\`if \${Math.random()>.5}then local \${generateVarName(lite)}=nil end;\${lite?'':'\\n'}\`,
     ()=>\`for \${generateVarName(lite)}=1,\${Math.floor(10*Math.random())}do end;\${lite?'':'\\n'}\`,
-    ()=>\`local \${generateVarName(lite)}=math.floor(\${1e3*Math.random()});\${lite?'':'\\n'}\`,
     ()=>\`local \${generateVarName(lite)}=string.char(\${Math.floor(128*Math.random())});\${lite?'':'\\n'}\`,
-    ()=>\`local function \${generateVarName(lite)}()return \${Math.random()}*\${Math.random()}end;\${lite?'':'\\n'}\`,
-    ()=>\`local \${generateVarName(lite)}=(function()return"\${randomString(lite?8:15)}"end)();\${lite?'':'\\n'}\`,
-    ()=>\`do local \${generateVarName(lite)}=\${Math.random()};end;\${lite?'':'\\n'}\`,
     ()=>\`while false do local \${generateVarName(lite)}=true;break;end;\${lite?'':'\\n'}\`,
-    ()=>\`local \${generateVarName(lite)}=bit32 and bit32.bxor(\${Math.floor(255*Math.random())},\${Math.floor(255*Math.random())})or 0;\${lite?'':'\\n'}\`,
+    // ── 新強化パターン ──
+    // 数値を数式で偽装
+    ()=>generateNumericJunk(lite),
+    ()=>generateNumericJunk(lite),
+    // ゴミ関数（構文的に正しいが絶対呼ばれない）
+    ()=>generateJunkFunction(lite),
+    ()=>generateJunkFunction(lite),
+    // string.char(10進数) で文字列を偽装
+    ()=>\`local \${generateVarName(lite)}=\${strToDecimalChar(randomString(lite?4:8))};\${lite?'':'\\n'}\`,
+    ()=>\`local \${generateVarName(lite)}=\${strToDecimalChar(randomString(lite?4:8))};\${lite?'':'\\n'}\`,
+    // 数値を数式で偽装した配列
+    ()=>\`local \${generateVarName(lite)}={\${Array.from({length:lite?3:5},()=>numToExpr(Math.floor(Math.random()*100)+1)).join(",")}};\${lite?'':'\\n'}\`,
+    // 複数チャンク連結でゴミ文字列
+    ()=>\`local \${generateVarName(lite)}=\${strToConcat(randomString(lite?12:24),lite)};\${lite?'':'\\n'}\`,
+    // pcallで常にfalseになるゴミ処理
+    ()=>{\`local \${generateVarName(lite)},\${generateVarName(lite)}=pcall(function()return \${numToExpr(Math.floor(Math.random()*100))} end);\${lite?'':'\\n'}\`},
+    // bit32偽装計算
+    ()=>\`local \${generateVarName(lite)}=bit32 and bit32.bxor(\${numToExpr(Math.floor(Math.random()*255))},\${numToExpr(Math.floor(Math.random()*255))})or \${Math.floor(Math.random()*255)};\${lite?'':'\\n'}\`,
+    // string.rep でゴミ文字列
+    ()=>\`local \${generateVarName(lite)}=string.rep(\${strToDecimalChar(randomString(2))},\${Math.floor(Math.random()*5)+2});\${lite?'':'\\n'}\`,
+    // math系ゴミ計算
+    ()=>\`local \${generateVarName(lite)}=math.abs(math.floor(\${(Math.random()*1000-500).toFixed(4)}));\${lite?'':'\\n'}\`,
+    ()=>\`local \${generateVarName(lite)}=math.max(\${numToExpr(Math.floor(Math.random()*50))},\${numToExpr(Math.floor(Math.random()*50))});\${lite?'':'\\n'}\`,
+    // type()チェック偽装
+    ()=>\`local \${generateVarName(lite)}=type(\${strToDecimalChar(randomString(3))});\${lite?'':'\\n'}\`,
   ];
   for(let r=0;r<count;r++)e+=a[Math.floor(Math.random()*a.length)]();
   return e;
 }
 function injectJunkIntoCode(code,intensity,lite){
   const lines=code.split("\\n");let r=[];
+  const junkLines=[
+    ()=>\`local \${generateVarName(lite)}=\${numToExpr(Math.floor(Math.random()*1000)+1)};\`,
+    ()=>\`local \${generateVarName(lite)}=\${strToDecimalChar(randomString(lite?3:6))};\`,
+    ()=>\`local \${generateVarName(lite)}=math.max(\${numToExpr(Math.floor(Math.random()*50))},\${numToExpr(Math.floor(Math.random()*50))});\`,
+    ()=>generateJunkFunction(lite).replace(/\\n/g,''),
+  ];
   for(let i=0;i<lines.length;i++){
     r.push(lines[i]);
     if(Math.random()>.7&&intensity>50){
       const n=Math.floor(3*Math.random())+1;
-      for(let j=0;j<n;j++)r.push(\`local \${generateVarName(lite)}=\${Math.floor(1e3*Math.random())};\`);
+      for(let j=0;j<n;j++)r.push(junkLines[Math.floor(Math.random()*junkLines.length)]());
     }
   }
   return r.join(lite?'':'\\n');
@@ -331,16 +430,25 @@ async function processObfuscation(inputCode,opts){
       :\`local function \${a1}()local \${a2}=getfenv()local \${a3}=\${a2}[\${strToChar("getgenv")}]if \${a3} then \${a3}()[\${strToChar("saveinstance")}]=nil \${a3}()[\${strToChar("save_instance")}]=nil \${a3}()[\${strToChar("dumpstring")}]=nil end if debug then if debug.sethook then pcall(function()debug.sethook(function()while true do end end,"c")end)end if debug.getinfo then debug.getinfo=nil end end end pcall(\${a1})\\n\`;
   }
   if(adjJunk>0)out+=generateMassiveJunkCode(Math.floor(adjJunk/(lite?20:5)),lite);
+  // ゴミ関数の追加注入
+  if(opts.useJunkFunc&&!lite){
+    const jfCount=Math.floor(adjJunk/30)+3;
+    for(let i=0;i<jfCount;i++)out+=generateJunkFunction(lite);
+  }
   out+=b64Decoder+(lite?'':'\\n');
   if(opts.useXor&&xorDecoder)out+=lite?minifyCode(xorDecoder):xorDecoder+"\\n";
   if(opts.useShuffle){
     const chunks=[];for(let i=0;i<a.length;i+=500)chunks.push(a.substring(i,i+500));
     let arr=chunks.map((v,i)=>({v,i}));
     for(let i=arr.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[arr[i],arr[j]]=[arr[j],arr[i]];}
-    let tbl="{";arr.forEach(x=>{tbl+=\`[\${x.i+1}]="\${x.v}",\`;});tbl+="}";
-    out+=lite?\`local \${vTbl}=\${tbl}local \${vStr}=""for i=1,#\${vTbl} do \${vStr}=\${vStr}..\${vTbl}[i]end\`:\`local \${vTbl}=\${tbl}\\nlocal \${vStr}=""\\nfor i=1,#\${vTbl} do \${vStr}=\${vStr}..\${vTbl}[i]end\\n\`;
+    // チャンクをそのまま文字列で入れる（Base64なので安全）
+    let tbl="{";arr.forEach(x=>{tbl+=\`[\${numToExpr(x.i+1)}]="\${x.v}",\`;});tbl+="}";
+    const vIdx=generateVarName(lite);
+    out+=lite
+      ?\`local \${vTbl}=\${tbl}local \${vStr}=""for \${vIdx}=1,\${numToExpr(arr.length)} do \${vStr}=\${vStr}..\${vTbl}[\${vIdx}]end\`
+      :\`local \${vTbl}=\${tbl}\nlocal \${vStr}=""\nfor \${vIdx}=1,\${numToExpr(arr.length)} do \${vStr}=\${vStr}..\${vTbl}[\${vIdx}]end\n\`;
   }else{
-    out+=lite?\`local \${vStr}="\${a}"\`:\`local \${vStr}="\${a}"\\n\`;
+    out+=lite?\`local \${vStr}="\${a}"\`:\`local \${vStr}="\${a}"\n\`;
   }
   if(opts.useFlat){
     let steps=[];
@@ -363,7 +471,7 @@ async function startObfuscation(){
   if(!code.trim()){setObfStatus("エラー: コードが空です","error");return;}
   const btn=byId('btnObfuscate');btn.disabled=true;
   try{
-    const opts={layers:parseInt(byId('b64Layers').value),junk:parseInt(byId('junkIntensity').value),useXor:byId('chkXor').checked,useShuffle:byId('chkShuffle').checked,useFlat:byId('chkFlat').checked,useAntiDump:byId('chkAntiDump').checked,useLite:byId('chkLite').checked};
+    const opts={layers:parseInt(byId('b64Layers').value),junk:parseInt(byId('junkIntensity').value),useXor:byId('chkXor').checked,useShuffle:byId('chkShuffle').checked,useFlat:byId('chkFlat').checked,useAntiDump:byId('chkAntiDump').checked,useLite:byId('chkLite').checked,useDecimalStr:byId('chkDecimalStr').checked,useNumExpr:byId('chkNumExpr').checked,useJunkFunc:byId('chkJunkFunc').checked};
     setObfStatus("処理中...","process");updateObfProgress(0);
     const result=await processObfuscation(code,opts);
     byId('obfOutput').value=result;
