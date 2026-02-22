@@ -25,6 +25,15 @@ function checkLuaAvailable() {
   return null;
 }
 
+// Prometheus は Lua5.1 専用なので専用バイナリを探す
+function checkLua51Available() {
+  try { execSync('lua5.1 -v 2>&1', { timeout: 3000 }); return 'lua5.1'; } catch {}
+  try { execSync('luajit -v 2>&1', { timeout: 3000 }); return 'luajit'; } catch {}
+  // lua5.4 でも一応試す（動かない場合もある）
+  try { execSync('lua -v 2>&1', { timeout: 3000 }); return 'lua'; } catch {}
+  return null;
+}
+
 function checkPrometheusAvailable() {
   return fs.existsSync(path.join(__dirname, 'prometheus', 'cli.lua'))
       || fs.existsSync(path.join(__dirname, 'cli.lua'));
@@ -331,15 +340,16 @@ async function autoDeobfuscate(code) {
 // ════════════════════════════════════════════════════════
 function obfuscateWithPrometheus(code, options = {}) {
   return new Promise(resolve => {
-    const luaBin = checkLuaAvailable();
-    if (!luaBin) { resolve({ success: false, error: 'LuaまたはLuaJITがインストールされていません' }); return; }
+    // PrometheusはLua5.1専用 → lua5.1 → luajit → lua の順で探す
+    const luaBin = checkLua51Available();
+    if (!luaBin) { resolve({ success: false, error: 'lua5.1またはLuaJITがインストールされていません' }); return; }
 
     const cliPath = fs.existsSync(path.join(__dirname, 'prometheus', 'cli.lua'))
       ? path.join(__dirname, 'prometheus', 'cli.lua')
       : path.join(__dirname, 'cli.lua');
 
     if (!fs.existsSync(cliPath)) {
-      resolve({ success: false, error: 'Prometheusが見つかりません。git clone https://github.com/prometheus-lua/Prometheus.git prometheus を実行してください' });
+      resolve({ success: false, error: 'Prometheusが見つかりません' });
       return;
     }
 
@@ -349,11 +359,11 @@ function obfuscateWithPrometheus(code, options = {}) {
 
     const preset = options.preset || 'Medium';
     const steps  = options.steps  || [];
-    let cmd = `${luaBin} ${cliPath} --preset ${preset}`;
-    if (steps.length > 0) cmd += ` --steps ${steps.join(',')}`;
-    cmd += ` --out ${tmpOut} ${tmpIn}`;
 
-    exec(cmd, { timeout: 30000 }, (err, stdout, stderr) => {
+    // 正しい引数順: lua cli.lua --preset Medium input.lua --out output.lua
+    const cmd = `${luaBin} ${cliPath} --preset ${preset} ${tmpIn} --out ${tmpOut}`;
+
+    exec(cmd, { timeout: 30000, cwd: path.dirname(cliPath) }, (err, stdout, stderr) => {
       try { fs.unlinkSync(tmpIn); } catch {}
       try {
         if (err) { resolve({ success: false, error: stderr || err.message }); return; }
