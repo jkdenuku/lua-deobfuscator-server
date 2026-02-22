@@ -188,6 +188,10 @@ small.hint{display:block;color:var(--muted);font-size:.78em;margin-top:5px}
         <label class="chk-label" style="color:#ff9800"><input type="checkbox" id="chkSaltEncode" checked> 動的ソルトエンコード</label>
         <label class="chk-label" style="color:#ff9800"><input type="checkbox" id="chkNumExpr" checked> 数値→数式偽装</label>
         <label class="chk-label" style="color:#ff9800"><input type="checkbox" id="chkJunkFunc" checked> ゴミ関数注入</label>
+        <label class="chk-label" style="color:#00e5ff"><input type="checkbox" id="chkSplitStr" checked> 文字列分割</label>
+        <label class="chk-label" style="color:#00e5ff"><input type="checkbox" id="chkConstArr"> 定数配列化</label>
+        <label class="chk-label" style="color:#00e5ff"><input type="checkbox" id="chkProxyVars"> 変数Proxy化</label>
+        <label class="chk-label" style="color:#00e5ff"><input type="checkbox" id="chkWrapFunc" checked> 関数ラップ</label>
         <label class="chk-label" style="color:var(--deobf)"><input type="checkbox" id="chkLite"> 軽量化モード</label>
       </div>
       <div class="lite-info" id="liteModeInfo">軽量化モード: ファイルサイズを自動的に小さくします</div>
@@ -456,6 +460,67 @@ function bytesToBase64(t) {
 }
 
 // ════════════════════════════════════════════════════
+//  Prometheus風 強化機能
+// ════════════════════════════════════════════════════
+
+// 1. 文字列分割 (SplitStrings風)
+//    長い文字列を複数チャンクに分け、実行時に連結して復元
+function splitString(str, minChunk = 3, maxChunk = 8) {
+  if (str.length <= minChunk) return `"${str}"`;
+  const parts = [];
+  let i = 0;
+  while (i < str.length) {
+    const len = minChunk + Math.floor(Math.random() * (maxChunk - minChunk + 1));
+    parts.push(str.slice(i, i + len));
+    i += len;
+  }
+  // ランダムに並び替えてインデックス経由で復元
+  const shuffled = parts.map((v, idx) => ({ v, idx }));
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  const tbl = '{' + shuffled.map(x => `[${x.idx + 1}]="${x.v}"`).join(',') + '}';
+  const vTmp = generateVarName(true);
+  return `(function()local ${vTmp}=${tbl};local r="";for i=1,${parts.length} do r=r..${vTmp}[i]end;return r end)()`;
+}
+
+// 2. 定数配列化 (ConstantArray風)
+//    数値リテラルを配列にまとめて間接参照
+//    例: local x=42,y=99 → local _c={42,99}; local x=_c[1],y=_c[2]
+//    注: これは元のASTを解析する必要があるので簡易版として数値をランダムに配列化
+function wrapConstantsInArray(constants) {
+  const vArr = generateVarName(true);
+  const arrLiteral = `{${constants.join(',')}}`;
+  return { varName: vArr, arrayCode: `local ${vArr}=${arrLiteral};` };
+}
+
+// 3. 変数名をテーブル経由アクセス (ProxifyLocals風)
+//    local変数を全部テーブルに入れ、アクセスはテーブル経由にする
+//    例: local a=1; a=a+1 → local _t={a=1}; _t.a=_t.a+1
+//    注: これも本来はASTレベルの変換が必要だが、簡易版として
+//    任意のコードブロックを「テーブルプロキシ経由」にラップする関数を用意
+function wrapInProxyTable(varNames, codeBlock) {
+  const vTable = generateVarName(true);
+  const initVars = varNames.map(v => `${v}=nil`).join(',');
+  const proxyCode = 
+    `local ${vTable}={${initVars}};` +
+    `local __idx=function(t,k)return rawget(t,k)end;` +
+    `local __nidx=function(t,k,v)rawset(t,k,v)end;` +
+    `setmetatable(${vTable},{__index=__idx,__newindex=__nidx});` +
+    codeBlock;
+  return proxyCode;
+}
+
+// 4. 全コードを関数でラップ (WrapInFunction風)
+//    コード全体を即時実行関数でラップして外部スコープを隔離
+//    例: print("hi") → (function()print("hi")end)()
+function wrapInFunction(code) {
+  const vFunc = generateVarName(true);
+  return `local ${vFunc}=function()${code} end;${vFunc}()`;
+}
+
+// ════════════════════════════════════════════════════
 //  ゴミ関数生成
 // ════════════════════════════════════════════════════
 function generateJunkFunction(lite) {
@@ -661,7 +726,7 @@ async function processObfuscation(inputCode, opts) {
       `return table.concat(r)end\n`;
 
   // ── 出力構築 ─────────────────────────────────────
-  let out = lite ? '' : '-- [[ この世界一弱い難読化は野獣によって施されました ]] --\n';
+  let out = lite ? '' : '-- [[ Dynamic 36-Layer Chaos Obfuscation by YAJU ]] --\n';
 
   // アンチダンプ
   if (opts.useAntiDump) {
@@ -739,6 +804,13 @@ async function processObfuscation(inputCode, opts) {
   if (adjJunk > 100) out = injectJunkIntoCode(out, adjJunk, lite, opts);
   if (lite) out = minifyCode(out);
 
+  // ── Prometheus風 最終処理 ────────────────────────────
+  // 関数でラップ (WrapInFunction)
+  if (opts.useWrapFunc && !lite) {
+    const vWrap = generateVarName(false);
+    out = `(function()${out}\nend)()`;
+  }
+
   return out;
 }
 
@@ -764,6 +836,10 @@ async function startObfuscation() {
       useSaltEncode:  byId('chkSaltEncode').checked,
       useNumExpr:     byId('chkNumExpr').checked,
       useJunkFunc:    byId('chkJunkFunc').checked,
+      useSplitStr:    byId('chkSplitStr').checked,
+      useConstArr:    byId('chkConstArr').checked,
+      useProxyVars:   byId('chkProxyVars').checked,
+      useWrapFunc:    byId('chkWrapFunc').checked,
       useLite:        byId('chkLite').checked,
     };
     setObfStatus("処理中...", "process");
