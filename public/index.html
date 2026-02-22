@@ -677,21 +677,30 @@ async function startObfuscation(){
   if(byId('chkPSplitStr').checked) prometheusSteps.push('SplitStrings');
   if(byId('chkPVmify').checked) prometheusSteps.push('Vmify');
   try{
-    setObfStatus("処理中...","process");
-    let result=await processObfuscation(code,opts);
+    let result = code;
+
+    // ① Prometheusを先に実行（元のLuaコードに対して）
     if(prometheusSteps.length>0){
-      setObfStatus("Prometheusで追加難読化中...","process"); updateObfProgress(90);
+      setObfStatus("① Prometheusで難読化中...","process"); updateObfProgress(10);
       const preset=byId('obfPreset').value;
       const res=await fetch('/api/obfuscate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:result,preset,steps:prometheusSteps})});
       const data=await res.json();
       if(data.success&&data.result){
         result=data.result;
-        byId('obfOutLabel').textContent='[ 06 ] OUTPUT (+ Prometheus: '+prometheusSteps.join(', ')+')';
+        byId('obfOutLabel').textContent='[ 06 ] OUTPUT (Prometheus → ブラウザ難読化)';
       }else{
-        setObfStatus("⚠️ Prometheus失敗: "+(data.error||'')+"（ブラウザ処理結果を使用）","error");
+        setObfStatus("⚠️ Prometheus失敗: "+(data.error||'')+"（ブラウザ難読化のみ実行）","error");
         await sleep(2000);
+        // Prometheusが失敗しても元コードでブラウザ難読化を続行
+        result = code;
       }
     }
+
+    // ② そのあとブラウザ側の難読化（Base64/XOR等）
+    setObfStatus(prometheusSteps.length>0 ? "② ブラウザ難読化中..." : "処理中...","process");
+    updateObfProgress(40);
+    result=await processObfuscation(result,opts);
+
     byId('obfOutput').value=result;
     const sz=new Blob([result]).size;
     const szStr=sz>=1048576?`${(sz/1048576).toFixed(2)} MB`:sz>=1024?`${(sz/1024).toFixed(2)} KB`:`${sz} bytes`;
