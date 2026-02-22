@@ -91,6 +91,7 @@ app.post('/api/obfuscate', async (req, res) => {
   res.json(await obfuscateWithPrometheus(code, { preset, steps }));
 });
 
+
 // ════════════════════════════════════════════════════════
 //  動的実行 (オリジナル: loadstring フック)
 // ════════════════════════════════════════════════════════
@@ -358,18 +359,35 @@ function obfuscateWithPrometheus(code, options = {}) {
     fs.writeFileSync(tmpIn, code);
 
     const preset = options.preset || 'Medium';
-    const steps  = options.steps  || [];
-
-    // 正しい引数順: lua cli.lua --preset Medium input.lua --out output.lua
+    // stepsは現状Prometheusのargとして渡すと問題が起きるため使わない
+    // preset のみで制御する
     const cmd = `${luaBin} ${cliPath} --preset ${preset} ${tmpIn} --out ${tmpOut}`;
+
+    console.log('[Prometheus] cmd:', cmd);
+    console.log('[Prometheus] input preview:', JSON.stringify(code.substring(0, 120)));
 
     exec(cmd, { timeout: 30000, cwd: path.dirname(cliPath) }, (err, stdout, stderr) => {
       try { fs.unlinkSync(tmpIn); } catch {}
+      const errText = (stderr || '').trim();
+      const outText = (stdout || '').trim();
+      console.log('[Prometheus] stdout:', outText.substring(0, 200));
+      console.log('[Prometheus] stderr:', errText.substring(0, 200));
       try {
-        if (err) { resolve({ success: false, error: stderr || err.message }); return; }
-        if (!fs.existsSync(tmpOut)) { resolve({ success: false, error: 'Prometheusが出力を生成しませんでした' }); return; }
+        if (err) {
+          // エラー内容をそのままフロントに返す
+          resolve({ success: false, error: 'Lua: ' + errText });
+          return;
+        }
+        if (!fs.existsSync(tmpOut)) {
+          resolve({ success: false, error: 'Prometheusが出力ファイルを生成しませんでした。stderr: ' + errText });
+          return;
+        }
         const result = fs.readFileSync(tmpOut, 'utf8');
-        resolve({ success: true, result, preset, steps });
+        if (!result || result.trim().length === 0) {
+          resolve({ success: false, error: 'Prometheusの出力が空でした' });
+          return;
+        }
+        resolve({ success: true, result, preset });
       } finally {
         try { fs.unlinkSync(tmpOut); } catch {}
       }
