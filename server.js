@@ -25,11 +25,9 @@ function checkLuaAvailable() {
   return null;
 }
 
-// Prometheus は Lua5.1 専用なので専用バイナリを探す
 function checkLua51Available() {
   try { execSync('lua5.1 -v 2>&1', { timeout: 3000 }); return 'lua5.1'; } catch {}
   try { execSync('luajit -v 2>&1', { timeout: 3000 }); return 'luajit'; } catch {}
-  // lua5.4 でも一応試す（動かない場合もある）
   try { execSync('lua -v 2>&1', { timeout: 3000 }); return 'lua'; } catch {}
   return null;
 }
@@ -40,7 +38,7 @@ function checkPrometheusAvailable() {
 }
 
 // ════════════════════════════════════════════════════════
-//  STATUS  GET /api/status
+//  STATUS
 // ════════════════════════════════════════════════════════
 app.get('/api/status', (req, res) => {
   res.json({
@@ -54,7 +52,7 @@ app.get('/api/status', (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════
-//  解読 API  POST /api/deobfuscate
+//  解読 API
 // ════════════════════════════════════════════════════════
 app.post('/api/deobfuscate', async (req, res) => {
   const { code, method } = req.body;
@@ -65,9 +63,9 @@ app.post('/api/deobfuscate', async (req, res) => {
     case 'xor':             result = deobfuscateXOR(code);           break;
     case 'split_strings':   result = deobfuscateSplitStrings(code);  break;
     case 'encrypt_strings': result = deobfuscateEncryptStrings(code); break;
-    case 'constant_array':   result = deobfuscateConstantArray(code);  break;
+    case 'constant_array':  result = deobfuscateConstantArray(code);  break;
     case 'eval_expressions': result = evaluateExpressions(code);      break;
-    case 'vmify':            result = deobfuscateVmify(code);         break;
+    case 'vmify':           result = deobfuscateVmify(code);         break;
     case 'dynamic':         result = await tryDynamicExecution(code); break;
     case 'auto':
     default:                result = await autoDeobfuscate(code);    break;
@@ -76,15 +74,14 @@ app.post('/api/deobfuscate', async (req, res) => {
   res.json(result);
 });
 
-// 後方互換 (旧エンドポイント)
 app.post('/deobfuscate', async (req, res) => {
   const { code } = req.body;
   if (!code) return res.json({ success: false, error: 'コードが提供されていません' });
-  res.json(deobfuscateXOR(code));
+  res.json(await autoDeobfuscate(code));
 });
 
 // ════════════════════════════════════════════════════════
-//  難読化 API  POST /api/obfuscate  (Prometheus)
+//  難読化 API
 // ════════════════════════════════════════════════════════
 app.post('/api/obfuscate', async (req, res) => {
   const { code, preset, steps } = req.body;
@@ -92,57 +89,123 @@ app.post('/api/obfuscate', async (req, res) => {
   res.json(await obfuscateWithPrometheus(code, { preset, steps }));
 });
 
+// ════════════════════════════════════════════════════════
+//  共通ユーティリティ
+// ════════════════════════════════════════════════════════
+
+function scoreLuaCode(code) {
+  const keywords = ['local','function','end','if','then','else','return','for','do','while','and','or','not','nil','true','false','print','table','string','math'];
+  let score = 0;
+  keywords.forEach(kw => {
+    const m = code.match(new RegExp('\\b' + kw + '\\b', 'g'));
+    if (m) score += m.length * 10;
+  });
+  let printable = 0;
+  for (let i = 0; i < Math.min(code.length, 2000); i++) {
+    const c = code.charCodeAt(i);
+    if (c >= 32 && c <= 126) printable++;
+  }
+  score += (printable / Math.min(code.length, 2000)) * 100;
+  return score;
+}
+
+// 数式を評価（安全に）
+function evalSimpleExpr(expr) {
+  try {
+    const clean = expr.trim();
+    if (!/^[\d\s+\-*/%().]+$/.test(clean)) return null;
+    const result = Function('"use strict"; return (' + clean + ')')();
+    if (typeof result === 'number' && isFinite(result)) return Math.floor(result);
+    return null;
+  } catch { return null; }
+}
+
+// Luaエスケープシーケンスを解決
+function resolveLuaStringEscapes(str) {
+  return str
+    .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\r/g, '\r')
+    .replace(/\\\\/g, '\\').replace(/\\"/g, '"').replace(/\\'/g, "'")
+    .replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\(\d{1,3})/g, (_, d) => String.fromCharCode(parseInt(d, 10)));
+}
+
+// Luaの配列要素をパース（ネスト対応）
+function parseLuaArrayElements(content) {
+  const elements = [];
+  let cur = '', depth = 0, inStr = false, strChar = '', i = 0;
+  
+  while (i < content.length) {
+    const c = content[i];
+    
+    if (!inStr) {
+      if (c === '"' || c === "'") {
+        inStr = true;
+        strChar = c;
+        cur += c;
+      } else if (c === '[' && content[i+1] === '[') {
+        // 長い文字列リテラル [[...]]
+        let end = content.indexOf(']]', i + 2);
+        if (end === -1) end = content.length - 2;
+        cur += content.substring(i, end + 2);
+        i = end + 2;
+        continue;
+      } else if (c === '{') {
+        depth++;
+        cur += c;
+      } else if (c === '}') {
+        depth--;
+        cur += c;
+      } else if (c === ',' && depth === 0) {
+        if (cur.trim()) elements.push(cur.trim());
+        cur = '';
+      } else {
+        cur += c;
+      }
+    } else {
+      // 文字列内
+      if (c === '\\') {
+        cur += c + (content[i+1] || '');
+        i += 2;
+        continue;
+      }
+      if (c === strChar) {
+        inStr = false;
+      }
+      cur += c;
+    }
+    i++;
+  }
+  
+  if (cur.trim()) elements.push(cur.trim());
+  return elements;
+}
 
 // ════════════════════════════════════════════════════════
-//  動的実行  —  Renderサーバー上のLuaを最大限活用
-//
-//  方針:
-//   1. まず動的実行を試みる（これがメイン）
-//   2. 動的実行が失敗した場合のみ静的解析にフォールバック
-//   3. 多段難読化に対応（動的実行の結果を再帰的に動的実行）
-//   4. アンチダンプ・アンチデバッグを無効化してから実行
+//  動的実行（改良版）
 // ════════════════════════════════════════════════════════
 async function tryDynamicExecution(code) {
   const luaBin = checkLuaAvailable();
   if (!luaBin) return { success: false, error: 'Luaがインストールされていません', method: 'dynamic' };
 
   const tempFile = path.join(tempDir, `obf_${Date.now()}_${Math.random().toString(36).substring(7)}.lua`);
-
-  // ]] が含まれる場合のエスケープ
   const safeCode = code.replace(/\]\]/g, '] ]');
 
   const wrapper = `
--- ══════════════════════════════════════════
---  YAJU Deobfuscator - Dynamic Execution Wrapper
--- ══════════════════════════════════════════
-
--- 全キャプチャを格納するテーブル（多段対応）
+-- YAJU Deobfuscator - Enhanced Dynamic Execution
 local __captures = {}
 local __capture_count = 0
 local __original_loadstring = loadstring or load
 local __original_load = load or loadstring
 
--- アンチダンプ・アンチデバッグを無効化
+-- アンチダンプ無効化
 pcall(function()
   if debug then
     debug.sethook = function() end
-    debug.getinfo = nil
-    debug.getlocal = nil
-    debug.setlocal = nil
-    debug.getupvalue = nil
-    debug.setupvalue = nil
-  end
-end)
-pcall(function()
-  if getfenv then
-    local env = getfenv()
-    env.saveinstance = nil
-    env.dumpstring = nil
-    env.save_instance = nil
+    debug.getinfo = function() return {} end
   end
 end)
 
--- loadstring / load を完全フック
+-- loadstring/load完全フック
 local function __hook(code_str, ...)
   if type(code_str) == "string" and #code_str > 20 then
     __capture_count = __capture_count + 1
@@ -152,13 +215,13 @@ local function __hook(code_str, ...)
 end
 
 _G.loadstring = __hook
-_G.load       = __hook
+_G.load = __hook
 if rawset then
   pcall(function() rawset(_G, "loadstring", __hook) end)
   pcall(function() rawset(_G, "load", __hook) end)
 end
 
--- 難読化コードを実行
+-- コード実行
 local __obf_code = [[
 ${safeCode}
 ]]
@@ -169,9 +232,8 @@ local __ok, __err = pcall(function()
   chunk()
 end)
 
--- キャプチャ結果を出力（最後にキャプチャされたものが最も解読されたもの）
+-- 結果出力
 if __capture_count > 0 then
-  -- 最も長い（＝最も展開された）コードを選択
   local best = __captures[1]
   for i = 2, __capture_count do
     if #__captures[i] > #best then best = __captures[i] end
@@ -179,7 +241,6 @@ if __capture_count > 0 then
   io.write("__CAPTURED_START__")
   io.write(best)
   io.write("__CAPTURED_END__")
-  -- 多段情報も出力
   if __capture_count > 1 then
     io.write("__LAYERS__:" .. tostring(__capture_count))
   end
@@ -197,21 +258,18 @@ end
     exec(`${luaBin} ${tempFile}`, { timeout: 20000, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
       try { fs.unlinkSync(tempFile); } catch {}
 
-      // キャプチャ成功
       if (stdout.includes('__CAPTURED_START__') && stdout.includes('__CAPTURED_END__')) {
-        const start    = stdout.indexOf('__CAPTURED_START__') + '__CAPTURED_START__'.length;
-        const end      = stdout.indexOf('__CAPTURED_END__');
+        const start = stdout.indexOf('__CAPTURED_START__') + '__CAPTURED_START__'.length;
+        const end = stdout.indexOf('__CAPTURED_END__');
         const captured = stdout.substring(start, end).trim();
 
         if (captured && captured.length > 5) {
-          // 多段レイヤー数を取得
           const layerMatch = stdout.match(/__LAYERS__:(\d+)/);
           const layers = layerMatch ? parseInt(layerMatch[1]) : 1;
           return resolve({ success: true, result: captured, layers, method: 'dynamic' });
         }
       }
 
-      // エラー情報
       if (stdout.includes('__ERROR__:')) {
         const errMsg = stdout.split('__ERROR__:')[1] || '';
         return resolve({ success: false, error: 'Luaエラー: ' + errMsg.substring(0, 300), method: 'dynamic' });
@@ -221,85 +279,16 @@ end
         return resolve({ success: false, error: '実行エラー: ' + stderr.substring(0, 300), method: 'dynamic' });
       }
 
-      resolve({ success: false, error: 'loadstring()が呼ばれませんでした（VM系難読化の可能性）', method: 'dynamic' });
+      resolve({ success: false, error: 'loadstring()が呼ばれませんでした', method: 'dynamic' });
     });
   });
 }
 
 // ════════════════════════════════════════════════════════
-//  静的解読メソッド群  (全面改訂版)
+//  静的解読メソッド（完全改訂版）
 // ════════════════════════════════════════════════════════
 
-// ────────────────────────────────────────────────────────
-//  共通ユーティリティ
-// ────────────────────────────────────────────────────────
-
-/** Luaコードらしさのスコア */
-function scoreLuaCode(code) {
-  const keywords = ['local','function','end','if','then','else','return','for','do','while','and','or','not','nil','true','false','print','table','string','math'];
-  let score = 0;
-  keywords.forEach(kw => {
-    const m = code.match(new RegExp('\\b' + kw + '\\b', 'g'));
-    if (m) score += m.length * 10;
-  });
-  let printable = 0;
-  for (let i = 0; i < Math.min(code.length, 2000); i++) {
-    const c = code.charCodeAt(i);
-    if (c >= 32 && c <= 126) printable++;
-  }
-  score += (printable / Math.min(code.length, 2000)) * 100;
-  return score;
-}
-
-function parseLuaArrayElements(content) {
-  const elements = [];
-  let cur = '', depth = 0, inStr = false, strChar = '', i = 0;
-  while (i < content.length) {
-    const c = content[i];
-    if (!inStr) {
-      if (c === '"' || c === "'") { inStr = true; strChar = c; cur += c; }
-      else if (c === '[' && content[i+1] === '[') {
-        let end = content.indexOf(']]', i + 2);
-        if (end === -1) end = content.length - 2;
-        cur += content.substring(i, end + 2);
-        i = end + 2; continue;
-      }
-      else if (c === '{') { depth++; cur += c; }
-      else if (c === '}') { depth--; cur += c; }
-      else if (c === ',' && depth === 0) { elements.push(cur.trim()); cur = ''; }
-      else { cur += c; }
-    } else {
-      if (c === '\\') { cur += c + (content[i+1] || ''); i += 2; continue; }
-      if (c === strChar) { inStr = false; }
-      cur += c;
-    }
-    i++;
-  }
-  if (cur.trim()) elements.push(cur.trim());
-  return elements;
-}
-
-function resolveLuaStringEscapes(str) {
-  return str
-    .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\r/g, '\r')
-    .replace(/\\\\/g, '\\').replace(/\\"/g, '"').replace(/\\'/g, "'")
-    .replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
-    .replace(/\\(\d{1,3})/g, (_, d) => String.fromCharCode(parseInt(d, 10)));
-}
-
-function evalSimpleExpr(expr) {
-  try {
-    const clean = expr.trim();
-    if (!/^[\d\s+\-*/%().]+$/.test(clean)) return null;
-    const result = Function('"use strict"; return (' + clean + ')')();
-    if (typeof result === 'number' && isFinite(result)) return Math.floor(result);
-    return null;
-  } catch { return null; }
-}
-
-// ────────────────────────────────────────────────────────
-//  XOR 解読
-// ────────────────────────────────────────────────────────
+// ── XOR解読 ──
 function xorDecryptByte(byte, key) {
   let result = 0;
   for (let i = 0; i < 8; i++) {
@@ -312,6 +301,7 @@ function xorDecryptByte(byte, key) {
 function deobfuscateXOR(code) {
   const patterns = [/local\s+\w+\s*=\s*\{([0-9,\s]+)\}/g, /\{([0-9,\s]+)\}/g];
   let encryptedArrays = [];
+  
   for (const pattern of patterns) {
     let match;
     const p = new RegExp(pattern.source, pattern.flags);
@@ -321,220 +311,353 @@ function deobfuscateXOR(code) {
     }
     if (encryptedArrays.length > 0) break;
   }
-  if (encryptedArrays.length === 0) return { success: false, error: '暗号化配列が見つかりません', method: 'xor' };
+  
+  if (encryptedArrays.length === 0) {
+    return { success: false, error: '暗号化配列が見つかりません', method: 'xor' };
+  }
+  
   let bestResult = null, bestScore = -1, bestKey = -1;
   for (const arr of encryptedArrays) {
     for (let key = 0; key <= 255; key++) {
       const str = arr.map(b => String.fromCharCode(xorDecryptByte(b, key))).join('');
       const score = scoreLuaCode(str);
-      if (score > bestScore) { bestScore = score; bestResult = str; bestKey = key; }
+      if (score > bestScore) {
+        bestScore = score;
+        bestResult = str;
+        bestKey = key;
+      }
     }
   }
-  if (bestScore < 10) return { success: false, error: '有効なLuaコードが見つかりませんでした', method: 'xor' };
+  
+  if (bestScore < 10) {
+    return { success: false, error: '有効なLuaコードが見つかりませんでした', method: 'xor' };
+  }
+  
   return { success: true, result: bestResult, key: bestKey, score: bestScore, method: 'xor' };
 }
 
-// ────────────────────────────────────────────────────────
-//  SplitStrings / EncryptStrings / ConstantArray / Eval
-// ────────────────────────────────────────────────────────
+// ── 文字列分割の結合 ──
 function deobfuscateSplitStrings(code) {
   let modified = code, found = false, iterations = 0;
-  const re1 = /"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g;
-  const re2 = /'((?:[^'\\]|\\.)*)'\s*\.\.\s*'((?:[^'\\]|\\.)*)'/g;
-  while (re1.test(modified) && iterations < 60) {
-    modified = modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g, (_, a, b) => `"${a}${b}"`);
-    found = true; iterations++; re1.lastIndex = 0;
+  
+  // "abc" .. "def" → "abcdef"
+  while (/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.*)*)"/g.test(modified) && iterations < 60) {
+    modified = modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.*)*)"/g, (_, a, b) => {
+      found = true;
+      return `"${a}${b}"`;
+    });
+    iterations++;
   }
-  while (re2.test(modified) && iterations < 120) {
-    modified = modified.replace(/'((?:[^'\\]|\\.)*)'\s*\.\.\s*'((?:[^'\\]|\\.)*)'/g, (_, a, b) => `'${a}${b}'`);
-    found = true; iterations++; re2.lastIndex = 0;
+  
+  // 'abc' .. 'def' → 'abcdef'
+  while (/'((?:[^'\\]|\\.)*)'\s*\.\.\s*'((?:[^'\\]|\\.*)*)'/g.test(modified) && iterations < 120) {
+    modified = modified.replace(/'((?:[^'\\]|\\.)*)'\s*\.\.\s*'((?:[^'\\]|\\.*)*)'/g, (_, a, b) => {
+      found = true;
+      return `'${a}${b}'`;
+    });
+    iterations++;
   }
-  if (!found) return { success: false, error: 'SplitStringsパターンが見つかりません', method: 'split_strings' };
+  
+  if (!found) {
+    return { success: false, error: 'SplitStringsパターンが見つかりません', method: 'split_strings' };
+  }
+  
   return { success: true, result: modified, method: 'split_strings' };
 }
 
+// ── 文字列暗号化の解読（強化版）──
 function deobfuscateEncryptStrings(code) {
   let modified = code, found = false;
-  modified = modified.replace(/string\.char\(([\d,\s]+)\)/g, (_, nums) => {
+  
+  // string.char(112, 114, 105, 110, 116) → "print"
+  modified = modified.replace(/string\.char\s*\(\s*([\d,\s]+)\s*\)/g, (match, nums) => {
     const chars = nums.split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n) && n >= 0 && n <= 65535);
-    if (chars.length === 0) return _;
+    if (chars.length === 0) return match;
     found = true;
-    return `"${chars.map(c => { const ch = String.fromCharCode(c); return ch === '"' ? '\\"' : ch === '\\' ? '\\\\' : ch; }).join('')}"`;
+    const str = chars.map(c => {
+      const ch = String.fromCharCode(c);
+      // エスケープが必要な文字
+      if (ch === '"') return '\\"';
+      if (ch === '\\') return '\\\\';
+      if (ch === '\n') return '\\n';
+      if (ch === '\t') return '\\t';
+      if (ch === '\r') return '\\r';
+      return ch;
+    }).join('');
+    return `"${str}"`;
   });
-  modified = modified.replace(/"((?:\\[0-9]{1,3}|\\x[0-9a-fA-F]{2}|[^"\\])+)"/g, (match, inner) => {
+  
+  // "\112\114\105\110\116" → "print"
+  modified = modified.replace(/"((?:\\[0-9]{1,3}|\\x[0-9a-fA-F]{2}|[^"\\]|\\.)*)"/g, (match, inner) => {
     if (!/\\[0-9]|\\x/i.test(inner)) return match;
     try {
       const decoded = resolveLuaStringEscapes(inner);
-      if ([...decoded].every(c => c.charCodeAt(0) >= 32 && c.charCodeAt(0) <= 126)) {
+      // 印字可能文字のみならデコード
+      if ([...decoded].every(c => {
+        const code = c.charCodeAt(0);
+        return code >= 32 && code <= 126;
+      })) {
         found = true;
-        return `"${decoded.replace(/"/g, '\\"').replace(/\\/g, '\\\\')}"`;
+        // 再エスケープ
+        const escaped = decoded.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        return `"${escaped}"`;
       }
     } catch {}
     return match;
   });
-  if (!found) return { success: false, error: 'EncryptStringsパターンが見つかりません', method: 'encrypt_strings' };
+  
+  // 16進数: 0x70, 0x72 → 112, 114
+  modified = modified.replace(/0x([0-9a-fA-F]+)/g, (match, hex) => {
+    const dec = parseInt(hex, 16);
+    if (!isNaN(dec) && dec >= 0 && dec <= 65535) {
+      found = true;
+      return String(dec);
+    }
+    return match;
+  });
+  
+  if (!found) {
+    return { success: false, error: 'EncryptStringsパターンが見つかりません', method: 'encrypt_strings' };
+  }
+  
   return { success: true, result: modified, method: 'encrypt_strings' };
 }
 
+// ── 定数配列の展開（完全改訂版）──
 function deobfuscateConstantArray(code) {
-  let modified = code, found = false;
+  let modified = code;
+  let found = false;
   let passCount = 0;
+  
+  // 最大10パス（多段テーブル対応）
   while (passCount++ < 10) {
     let changed = false;
+    
+    // テーブル定義を探す: local name = { ... }
     const arrayPattern = /local\s+(\w+)\s*=\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\}/g;
-    let match;
     const snapshot = modified;
+    let match;
+    
     while ((match = arrayPattern.exec(snapshot)) !== null) {
-      const varName = match[1], content = match[2];
+      const varName = match[1];
+      const content = match[2];
+      
+      // 配列要素をパース
       const elements = parseLuaArrayElements(content);
       if (elements.length < 1) continue;
+      
+      // varName[index] を置換
       const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const indexRe = new RegExp(escaped + '\\[([^\\]]+)\\]', 'g');
+      
       modified = modified.replace(indexRe, (fullMatch, indexExpr) => {
+        // インデックス式を評価
         const idx = evalSimpleExpr(indexExpr.trim());
         if (idx === null || idx < 1 || idx > elements.length) return fullMatch;
-        found = true; changed = true;
+        
+        found = true;
+        changed = true;
         return elements[idx - 1];
       });
     }
+    
     if (!changed) break;
   }
-  if (!found) return { success: false, error: 'ConstantArrayパターンが見つかりません', method: 'constant_array' };
+  
+  if (!found) {
+    return { success: false, error: 'ConstantArrayパターンが見つかりません', method: 'constant_array' };
+  }
+  
   return { success: true, result: modified, method: 'constant_array' };
 }
 
+// ── 式の評価 ──
 function evaluateExpressions(code) {
   let modified = code, found = false;
+  
+  // (1 + 2) → 3
   let prev, iters = 0;
   do {
     prev = modified;
-    modified = modified.replace(/\(\s*([\d.]+)\s*([\+\-\*\/\%])\s*([\d.]+)\s*\)/g, (_, a, op, b) => {
+    modified = modified.replace(/\(\s*([\d.]+)\s*([\+\-\*\/\%])\s*([\d.]+)\s*\)/g, (match, a, op, b) => {
       const result = evalSimpleExpr(`${a}${op}${b}`);
-      if (result === null) return _;
-      found = true; return String(result);
+      if (result === null) return match;
+      found = true;
+      return String(result);
     });
   } while (modified !== prev && ++iters < 20);
+  
+  // [1 + 0] → [1]
   modified = modified.replace(/\[\s*([\d\s+\-*\/%().]+)\s*\]/g, (match, expr) => {
     const result = evalSimpleExpr(expr);
     if (result === null) return match;
-    found = true; return `[${result}]`;
+    found = true;
+    return `[${result}]`;
   });
+  
+  // "abc" .. "def" → "abcdef"
   let concatIter = 0;
-  while (/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g.test(modified) && concatIter++ < 40) {
-    modified = modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g, (_, a, b) => { found = true; return `"${a}${b}"`; });
+  while (/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.*)*)"/g.test(modified) && concatIter++ < 40) {
+    modified = modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.*)*)"/g, (_, a, b) => {
+      found = true;
+      return `"${a}${b}"`;
+    });
   }
-  if (!found) return { success: false, error: '評価できる式がありませんでした', method: 'eval_expressions' };
+  
+  if (!found) {
+    return { success: false, error: '評価できる式がありませんでした', method: 'eval_expressions' };
+  }
+  
   return { success: true, result: modified, method: 'eval_expressions' };
 }
 
+// ── Vmify静的解析 ──
 function deobfuscateVmify(code) {
   const hints = [];
-  if (/return\s*\(function\s*\([^)]*\)/s.test(code)) hints.push('VMラッパー検出');
-  if (/\bInstructions\b|\bProto\b|\bupValues\b/i.test(code)) hints.push('Luaバイトコード構造を検出');
+  
+  if (/return\s*\(function\s*\([^)]*\)/s.test(code)) {
+    hints.push('VMラッパー検出');
+  }
+  
+  if (/\bInstructions\b|\bProto\b|\bupValues\b/i.test(code)) {
+    hints.push('Luaバイトコード構造を検出');
+  }
+  
   const strings = [];
   const strPattern = /"([^"\\]{4,}(?:\\.[^"\\]*)*)"/g;
   let m;
-  while ((m = strPattern.exec(code)) !== null) { if (m[1].length > 4) strings.push(m[1]); }
-  if (strings.length > 0) hints.push(`${strings.length}件の文字列リテラルを抽出`);
-  if (/\{(\s*\d+\s*,){8,}/.test(code)) hints.push('大規模バイトコードテーブルを検出');
-  if (hints.length === 0) return { success: false, error: 'Vmifyパターンが検出されませんでした', method: 'vmify' };
-  return { success: true, result: code, hints, strings: strings.slice(0, 50), warning: 'Vmify完全解読には動的実行を推奨', method: 'vmify' };
+  while ((m = strPattern.exec(code)) !== null) {
+    if (m[1].length > 4) strings.push(m[1]);
+  }
+  
+  if (strings.length > 0) {
+    hints.push(`${strings.length}件の文字列リテラルを抽出`);
+  }
+  
+  if (/\{(\s*\d+\s*,){8,}/.test(code)) {
+    hints.push('大規模バイトコードテーブルを検出');
+  }
+  
+  if (hints.length === 0) {
+    return { success: false, error: 'Vmifyパターンが検出されませんでした', method: 'vmify' };
+  }
+  
+  return {
+    success: true,
+    result: code,
+    hints,
+    strings: strings.slice(0, 50),
+    warning: 'Vmify完全解読には動的実行を推奨',
+    method: 'vmify'
+  };
 }
 
 // ════════════════════════════════════════════════════════
-//  AUTO  —  動的実行メイン、静的解析はフォールバック
+//  AUTO解読（最適化版）
 //
-//  フロー:
-//   ① まず動的実行を試みる（Renderサーバーのluaを使う）
-//   ② 成功した場合、結果をさらに動的実行（多段難読化対応）
-//   ③ 動的実行が失敗した場合のみ静的解析を試みる
-//   ④ 静的解析で変化があれば、もう一度動的実行を試みる
+//  戦略:
+//   1. まず静的解析で前処理（string.char, 配列展開など）
+//   2. 動的実行を試みる
+//   3. 動的実行の結果をさらに静的解析
+//   4. 必要に応じて多段実行
 // ════════════════════════════════════════════════════════
 async function autoDeobfuscate(code) {
   const results = [];
   let current = code;
   const luaBin = checkLuaAvailable();
-
-  // ① メイン: 動的実行
+  
+  // ステップ1: 静的解析で前処理
+  const staticSteps = [
+    { name: 'EncryptStrings',  fn: deobfuscateEncryptStrings },
+    { name: 'SplitStrings',    fn: deobfuscateSplitStrings },
+    { name: 'EvalExpressions', fn: evaluateExpressions },
+    { name: 'ConstantArray',   fn: deobfuscateConstantArray },
+  ];
+  
+  let staticChanged = false;
+  for (const step of staticSteps) {
+    const res = step.fn(current);
+    results.push({ step: step.name, ...res });
+    if (res.success && res.result && res.result !== current) {
+      current = res.result;
+      staticChanged = true;
+    }
+  }
+  
+  // ステップ2: 動的実行
   if (luaBin) {
     const dynRes = await tryDynamicExecution(current);
     results.push({ step: '動的実行 (1回目)', ...dynRes });
-
+    
     if (dynRes.success && dynRes.result) {
       current = dynRes.result;
-
-      // ② 多段難読化対応: 結果をさらに動的実行（最大3回）
-      for (let round = 2; round <= 4; round++) {
-        // 結果がまだ難読化されていそうか確認（loadstringやBase64の特徴があるか）
-        const stillObfuscated = /loadstring|load\s*\(|[A-Za-z0-9+/]{60,}={0,2}/.test(current);
-        if (!stillObfuscated) break;
-
-        const dynRes2 = await tryDynamicExecution(current);
-        results.push({ step: `動的実行 (${round}回目)`, ...dynRes2 });
-        if (dynRes2.success && dynRes2.result && dynRes2.result !== current) {
-          current = dynRes2.result;
-        } else {
-          break; // これ以上変化しないので停止
-        }
-      }
-    } else {
-      // ③ 動的実行が失敗 → 静的解析で前処理してから再挑戦
-      results.push({ step: '静的解析フォールバック開始', success: true, result: current, method: 'info' });
-
-      const staticSteps = [
-        { name: 'SplitStrings',    fn: deobfuscateSplitStrings },
-        { name: 'EncryptStrings',  fn: deobfuscateEncryptStrings },
-        { name: 'EvalExpressions', fn: evaluateExpressions },
-        { name: 'ConstantArray',   fn: deobfuscateConstantArray },
-        { name: 'XOR',             fn: deobfuscateXOR },
-      ];
-
-      let staticChanged = false;
+      
+      // ステップ3: 動的実行の結果をさらに静的解析
       for (const step of staticSteps) {
         const res = step.fn(current);
-        results.push({ step: step.name, ...res });
         if (res.success && res.result && res.result !== current) {
+          results.push({ step: `${step.name} (動的実行後)`, ...res });
           current = res.result;
-          staticChanged = true;
         }
       }
-
-      // ④ 静的解析で変化があれば動的実行を再試行
-      if (staticChanged) {
-        const dynRes3 = await tryDynamicExecution(current);
-        results.push({ step: '動的実行 (静的解析後)', ...dynRes3 });
-        if (dynRes3.success && dynRes3.result) current = dynRes3.result;
+      
+      // ステップ4: まだ難読化されていれば再度動的実行（最大3回）
+      for (let round = 2; round <= 4; round++) {
+        const stillObfuscated = /loadstring|load\s*\(|[A-Za-z0-9+/]{60,}={0,2}/.test(current);
+        if (!stillObfuscated) break;
+        
+        const dynRes2 = await tryDynamicExecution(current);
+        results.push({ step: `動的実行 (${round}回目)`, ...dynRes2 });
+        
+        if (dynRes2.success && dynRes2.result && dynRes2.result !== current) {
+          current = dynRes2.result;
+          
+          // 静的解析も再実行
+          for (const step of staticSteps) {
+            const res = step.fn(current);
+            if (res.success && res.result && res.result !== current) {
+              current = res.result;
+            }
+          }
+        } else {
+          break;
+        }
       }
+    } else if (staticChanged) {
+      // 動的実行が失敗したが静的解析で変化があった場合、XORも試す
+      const xorRes = deobfuscateXOR(current);
+      results.push({ step: 'XOR', ...xorRes });
+      if (xorRes.success && xorRes.result) current = xorRes.result;
     }
   } else {
     // Luaなし → 静的解析のみ
     results.push({ step: '動的実行', success: false, error: 'Luaがインストールされていません', method: 'dynamic' });
-    const staticSteps = [
-      { name: 'SplitStrings',    fn: deobfuscateSplitStrings },
-      { name: 'EncryptStrings',  fn: deobfuscateEncryptStrings },
-      { name: 'EvalExpressions', fn: evaluateExpressions },
-      { name: 'ConstantArray',   fn: deobfuscateConstantArray },
-      { name: 'XOR',             fn: deobfuscateXOR },
-      { name: 'Vmify',           fn: deobfuscateVmify },
-    ];
-    for (const step of staticSteps) {
-      const res = step.fn(current);
-      results.push({ step: step.name, ...res });
-      if (res.success && res.result && res.result !== current) current = res.result;
-    }
+    
+    const xorRes = deobfuscateXOR(current);
+    results.push({ step: 'XOR', ...xorRes });
+    if (xorRes.success && xorRes.result) current = xorRes.result;
+    
+    const vmifyRes = deobfuscateVmify(current);
+    results.push({ step: 'Vmify', ...vmifyRes });
   }
-
-  return { success: results.some(r => r.success), steps: results, finalCode: current };
+  
+  return {
+    success: results.some(r => r.success),
+    steps: results,
+    finalCode: current
+  };
 }
 
 // ════════════════════════════════════════════════════════
-//  Prometheus 難読化
+//  Prometheus難読化
 // ════════════════════════════════════════════════════════
 function obfuscateWithPrometheus(code, options = {}) {
   return new Promise(resolve => {
-    // PrometheusはLua5.1専用 → lua5.1 → luajit → lua の順で探す
     const luaBin = checkLua51Available();
-    if (!luaBin) { resolve({ success: false, error: 'lua5.1またはLuaJITがインストールされていません' }); return; }
+    if (!luaBin) {
+      resolve({ success: false, error: 'lua5.1またはLuaJITがインストールされていません' });
+      return;
+    }
 
     const cliPath = fs.existsSync(path.join(__dirname, 'prometheus', 'cli.lua'))
       ? path.join(__dirname, 'prometheus', 'cli.lua')
@@ -550,44 +673,36 @@ function obfuscateWithPrometheus(code, options = {}) {
     fs.writeFileSync(tmpIn, code);
 
     const preset = options.preset || 'Medium';
-    // stepsは現状Prometheusのargとして渡すと問題が起きるため使わない
-    // preset のみで制御する
     const cmd = `${luaBin} ${cliPath} --preset ${preset} ${tmpIn} --out ${tmpOut}`;
-
-    console.log('[Prometheus] cmd:', cmd);
-    console.log('[Prometheus] input preview:', JSON.stringify(code.substring(0, 120)));
 
     exec(cmd, { timeout: 30000, cwd: path.dirname(cliPath) }, (err, stdout, stderr) => {
       try { fs.unlinkSync(tmpIn); } catch {}
-      const errText = (stderr || '').trim();
-      const outText = (stdout || '').trim();
-      console.log('[Prometheus] stdout:', outText.substring(0, 200));
-      console.log('[Prometheus] stderr:', errText.substring(0, 200));
-      try {
-        if (err) {
-          // エラー内容をそのままフロントに返す
-          resolve({ success: false, error: 'Lua: ' + errText });
-          return;
-        }
-        if (!fs.existsSync(tmpOut)) {
-          resolve({ success: false, error: 'Prometheusが出力ファイルを生成しませんでした。stderr: ' + errText });
-          return;
-        }
-        const result = fs.readFileSync(tmpOut, 'utf8');
-        if (!result || result.trim().length === 0) {
-          resolve({ success: false, error: 'Prometheusの出力が空でした' });
-          return;
-        }
-        resolve({ success: true, result, preset });
-      } finally {
-        try { fs.unlinkSync(tmpOut); } catch {}
+      
+      if (err) {
+        resolve({ success: false, error: 'Lua: ' + (stderr || '').trim() });
+        return;
       }
+      
+      if (!fs.existsSync(tmpOut)) {
+        resolve({ success: false, error: 'Prometheusが出力ファイルを生成しませんでした' });
+        return;
+      }
+      
+      const result = fs.readFileSync(tmpOut, 'utf8');
+      try { fs.unlinkSync(tmpOut); } catch {}
+      
+      if (!result || result.trim().length === 0) {
+        resolve({ success: false, error: 'Prometheusの出力が空でした' });
+        return;
+      }
+      
+      resolve({ success: true, result, preset });
     });
   });
 }
 
 // ════════════════════════════════════════════════════════
-//  古い一時ファイルのクリーンアップ
+//  クリーンアップ
 // ════════════════════════════════════════════════════════
 setInterval(() => {
   const now = Date.now();
@@ -596,7 +711,9 @@ setInterval(() => {
     files.forEach(file => {
       const fp = path.join(tempDir, file);
       fs.stat(fp, (err, stats) => {
-        if (!err && now - stats.mtimeMs > 10 * 60 * 1000) fs.unlink(fp, () => {});
+        if (!err && now - stats.mtimeMs > 10 * 60 * 1000) {
+          fs.unlink(fp, () => {});
+        }
       });
     });
   });
