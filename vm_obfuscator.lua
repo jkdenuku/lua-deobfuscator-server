@@ -154,10 +154,26 @@ local vLoad  = vargen("l")  -- load/loadstring参照
 --    local l = load or loadstring
 --    l(o)()
 
+-- シードを3つの定数に分散して隠す (seed = (vA * vB) + vC)
+-- 解析者がシード値を直接読み取れないようにする
+local vA = vargen("a")  -- 定数A
+local vB = vargen("b")  -- 定数B
+local vC = vargen("c")  -- 定数C
+
+-- seed を A*B + C に分解 (ランダムなA,Bを選んでCを逆算)
+local split_a = math.random(100, 999)
+local split_b = math.random(100, 999)
+local split_c = seed - (split_a * split_b)
+-- split_c が負になる場合の調整
+if split_c < 0 then
+  split_b = math.floor(seed / split_a)
+  split_c = seed - (split_a * split_b)
+end
+
 local vm_runtime = string.format(
-  "-- [YAJU CustomVM seed=%d]\n"
-  .. "local %s=%s\n"
-  .. "local %s=%d\n"
+  "local %s=%s\n"
+  .. "local %s,%s,%s=%d,%d,%d\n"
+  .. "local %s=%s*%s+%s\n"
   .. "local %s=function()\n"
   .. "  %s=(%s*1664525+1013904223)%%4294967296\n"
   .. "  return %s%%256\n"
@@ -170,12 +186,12 @@ local vm_runtime = string.format(
   .. "local %s=table.concat(%s)\n"
   .. "local %s=load or loadstring\n"
   .. "%s(%s)()",
-  -- seed comment
-  seed,
   -- local d = {enc_bytes}
   vData, enc_table_str,
-  -- local s = seed
-  vSeed, seed,
+  -- local A, B, C = split_a, split_b, split_c
+  vA, vB, vC, split_a, split_b, split_c,
+  -- local s = A*B+C  (= seed を復元)
+  vSeed, vA, vB, vC,
   -- local p = function() s=...; return s%256 end
   vPrng,
     vSeed, vSeed,
