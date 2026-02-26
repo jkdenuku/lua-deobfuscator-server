@@ -254,6 +254,8 @@ small.hint{display:block;color:var(--muted);font-size:.78em;margin-top:5px}
         <label class="chk-label" style="color:#bb86fc"><input type="checkbox" id="chkPConstArr"> [P] ConstantArray</label>
         <label class="chk-label" style="color:#bb86fc"><input type="checkbox" id="chkPSplitStr"> [P] SplitStrings</label>
         <label class="chk-label" style="color:#bb86fc"><input type="checkbox" id="chkPVmify"> [P] Vmify (VM化)</label>
+        <!-- カスタムVM -->
+        <label class="chk-label" style="color:#ff9e57"><input type="checkbox" id="chkCustomVM"> [VM] カスタムVM難読化</label>
       </div>
       <div class="lite-info" id="liteModeInfo">軽量化モード: ファイルサイズを自動的に小さくします</div>
       <div class="prometheus-hint">[P] = <span>Prometheus連携機能</span>（要: server.js起動 + Luaインストール + prometheusフォルダ）</div>
@@ -268,6 +270,24 @@ small.hint{display:block;color:var(--muted);font-size:.78em;margin-top:5px}
         <option value="Strong">Strong</option>
       </select>
       <small class="hint" style="margin-top:8px">Prometheusステップが有効な場合に適用されます</small>
+    </div>
+
+    <!-- カスタムVMカード（[VM]選択時に表示） -->
+    <div class="card" id="vmCard" style="display:none;border-color:#ff9e57">
+      <div class="card-label" style="color:#ff9e57">[ VM ] CUSTOM VM設定</div>
+      <div style="font-size:.82em;color:var(--muted);margin-bottom:10px">
+        独自の仮想マシン命令セットでLuaコードを難読化します。<br>
+        Renderサーバー上のLuaで実行されます（luac使用）。
+      </div>
+      <label style="font-size:.82em;color:var(--muted);display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="chkVMSeed"> シードを固定する
+      </label>
+      <input type="number" id="vmSeedInput" placeholder="シード値 (例: 123456)" 
+        style="display:none;margin-top:8px;background:var(--bg);border:1px solid var(--border);
+        color:var(--text);padding:8px 12px;border-radius:6px;font-family:monospace;width:100%;font-size:.85em">
+      <div style="margin-top:10px;padding:8px;background:rgba(255,158,87,.08);border-radius:6px;font-size:.78em;color:#ff9e57">
+        ⚠️ VMコードはブラウザ難読化の<strong>前</strong>に実行されます
+      </div>
     </div>
 
     <button class="main-btn" id="btnObfuscate">⚡ 難読化を実行</button>
@@ -390,6 +410,15 @@ loadStatus();
     const any = ['chkPEncStr','chkPConstArr','chkPSplitStr','chkPVmify'].some(i=>document.getElementById(i).checked);
     document.getElementById('prometheusCard').style.display = any ? 'block' : 'none';
   });
+});
+
+// [VM] チェック時にVMカードを表示
+document.getElementById('chkCustomVM').addEventListener('change', function() {
+  document.getElementById('vmCard').style.display = this.checked ? 'block' : 'none';
+});
+// シード固定チェック
+document.getElementById('chkVMSeed').addEventListener('change', function() {
+  document.getElementById('vmSeedInput').style.display = this.checked ? 'block' : 'none';
 });
 
 // ════════════════════════════════════════════════════
@@ -681,31 +710,52 @@ async function startObfuscation(){
   if(byId('chkPConstArr').checked) prometheusSteps.push('ConstantArray');
   if(byId('chkPSplitStr').checked) prometheusSteps.push('SplitStrings');
   if(byId('chkPVmify').checked) prometheusSteps.push('Vmify');
+  const useCustomVM = byId('chkCustomVM').checked;
+  const vmSeedFixed = byId('chkVMSeed').checked;
+  const vmSeed = vmSeedFixed ? (parseInt(byId('vmSeedInput').value)||undefined) : undefined;
+
   try{
     let result = code;
+    let labelParts = [];
 
-    // ① Prometheusを先に実行（元のLuaコードに対して）
+    // ① カスタムVM難読化（元のLuaコードに対して最初に実行）
+    if(useCustomVM){
+      setObfStatus("① カスタムVM難読化中...","process"); updateObfProgress(5);
+      const res=await fetch('/api/vm-obfuscate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:result,seed:vmSeed})});
+      const data=await res.json();
+      if(data.success&&data.result){
+        result=data.result;
+        labelParts.push('CustomVM');
+      }else{
+        setObfStatus("⚠️ VM難読化失敗: "+(data.error||'')+"（スキップして続行）","error");
+        await sleep(2000);
+        result = code; // 元コードで続行
+      }
+    }
+
+    // ② Prometheusを実行（元コード or VM済みコードに対して）
     if(prometheusSteps.length>0){
-      setObfStatus("① Prometheusで難読化中...","process"); updateObfProgress(10);
+      const step = useCustomVM ? "②" : "①";
+      setObfStatus(`${step} Prometheusで難読化中...`,"process"); updateObfProgress(15);
       const preset=byId('obfPreset').value;
       const res=await fetch('/api/obfuscate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:result,preset,steps:prometheusSteps})});
       const data=await res.json();
       if(data.success&&data.result){
         result=data.result;
-        byId('obfOutLabel').textContent='[ 06 ] OUTPUT (Prometheus → ブラウザ難読化)';
+        labelParts.push('Prometheus');
       }else{
         setObfStatus("⚠️ Prometheus失敗: "+(data.error||'')+"（ブラウザ難読化のみ実行）","error");
         await sleep(2000);
-        // Prometheusが失敗しても元コードでブラウザ難読化を続行
-        result = code;
       }
     }
 
-    // ② そのあとブラウザ側の難読化（Base64/XOR等）
-    setObfStatus(prometheusSteps.length>0 ? "② ブラウザ難読化中..." : "処理中...","process");
+    // ③ ブラウザ側の難読化（Base64/XOR等）
+    const stepLabel = labelParts.length > 0 ? `${labelParts.join('→')}→ブラウザ難読化中...` : "処理中...";
+    setObfStatus(stepLabel,"process");
     updateObfProgress(40);
     result=await processObfuscation(result,opts);
 
+    if(labelParts.length>0) byId('obfOutLabel').textContent=`[ 06 ] OUTPUT (${labelParts.join(' → ')} → Browser)`;
     byId('obfOutput').value=result;
     const sz=new Blob([result]).size;
     const szStr=sz>=1048576?`${(sz/1048576).toFixed(2)} MB`:sz>=1024?`${(sz/1024).toFixed(2)} KB`:`${sz} bytes`;
