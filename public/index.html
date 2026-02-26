@@ -611,84 +611,305 @@ function minifyCode(code){
 // ════════════════════════════════════════════════════
 //  メイン難読化処理
 // ════════════════════════════════════════════════════
-async function processObfuscation(inputCode,opts){
-  const TARGET_SIZE=1.5*1024*1024;
-  let a=inputCode;
-  const lite=opts.useLite;
-  let adjLayers=opts.layers,adjJunk=opts.junk;
-  if(lite){
-    const estSize=new Blob([inputCode]).size*Math.pow(1.37,opts.layers);
-    if(estSize>TARGET_SIZE){
-      setObfStatus("軽量化: サイズ調整中...","process");
-      adjLayers=Math.max(3,Math.floor(Math.log(TARGET_SIZE/new Blob([inputCode]).size)/Math.log(1.37)));
-      adjJunk=Math.min(opts.junk,80);
+
+// ── アルゴリズム難読化ヘルパー ──────────────────────────
+// 生成されるLuaコード内で「標準的な定数・文字列・関数名」を隠す
+
+/**
+ * Base64アルファベット文字列を難読化して返す
+ * 解析者が "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg..." を直接見えないようにする
+ *
+ * 方式: アルファベットを複数のテーブルに分割し、実行時に結合
+ * 例:  local T = {"ABCDEFGHIJ", "KLMNOPQRST", ...}; local alpha = table.concat(T)
+ */
+function makeObfuscatedB64Alphabet(vAlpha, vParts, vConcat, lite) {
+  const full = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+  // ランダムな分割位置で複数チャンクに分ける
+  const chunkSizes = [];
+  let pos = 0;
+  while (pos < full.length) {
+    const sz = 7 + Math.floor(Math.random() * 8); // 7〜14文字
+    chunkSizes.push(Math.min(sz, full.length - pos));
+    pos += chunkSizes[chunkSizes.length - 1];
+  }
+  const chunks = [];
+  pos = 0;
+  for (const sz of chunkSizes) {
+    chunks.push(full.substring(pos, pos + sz));
+    pos += sz;
+  }
+  // 各チャンクをさらにstring.charで隠す（XORシフトで）
+  const key = Math.floor(Math.random() * 60) + 3;
+  const encChunks = chunks.map(chunk => {
+    const bytes = chunk.split('').map(c => c.charCodeAt(0));
+    const enc = bytes.map(b => (b + key) % 128);
+    return `(function()local _t={${enc.join(',')}};local _r={};for _i=1,#_t do _r[_i]=string.char(_t[_i]-${key})end;return table.concat(_r)end)()`;
+  });
+  const sep = lite ? '' : '\n';
+  return `local ${vParts}={${encChunks.join(',')}};${sep}local ${vAlpha}=table.concat(${vParts})${sep}`;
+}
+
+/**
+ * LCG定数 1664525 / 1013904223 を隠す
+ * 有名なNumerical Recipesの定数なのでそのまま書くと即バレ
+ *
+ * 方式: 各定数を3つの数値の演算に分解
+ *  1664525  = A*B + C  (ランダムに分解)
+ *  1013904223 = D*E + F
+ */
+function makeLCGConstants() {
+  const hideNum = (n) => {
+    // n = a*b + c の形に分解
+    const a = Math.floor(Math.random() * 900) + 100;
+    const b = Math.floor(n / a);
+    const c = n - a * b;
+    // さらにbをd-eに分解して3段にする
+    const d = b + Math.floor(Math.random() * 50) + 10;
+    const e = d - b;
+    return `(${a}*(${d}-${e})+${c})`;
+  };
+  return {
+    mul: hideNum(1664525),      // LCG乗数
+    add: hideNum(1013904223),   // LCG加数
+    mod: `(2^32)`,              // 2^32 をそのまま書かず指数で
+  };
+}
+
+/**
+ * loadstring / load の参照を難読化
+ * 解析者が "loadstring" を検索して引っかけるのを防ぐ
+ *
+ * 方式: _G["loa".."dstring"] のように文字列分割でアクセス
+ */
+function makeLoadstringRef(vRef, lite) {
+  // "loadstring" を分割パターンでアクセス
+  const patterns = [
+    // パターン1: _G テーブルから文字列結合でアクセス
+    () => {
+      const parts = ['loa', 'dst', 'rin', 'g'];
+      const escaped = parts.map(p => `"${p}"`).join('..');
+      return `(rawget and rawget(_G,${escaped}) or _G[${escaped}] or load)`;
+    },
+    // パターン2: string.byte でキー名を復元
+    () => {
+      const name = 'loadstring';
+      const bytes = name.split('').map(c => c.charCodeAt(0));
+      const key = Math.floor(Math.random() * 40) + 5;
+      const enc = bytes.map(b => (b + key) % 256);
+      return `(function()local _k=${key};local _b={${enc.join(',')}};local _n={};for _i=1,#_b do _n[_i]=string.char(_b[_i]-_k)end;local _s=table.concat(_n);return _G[_s] or load end)()`;
+    },
+    // パターン3: pcall + rawget の組み合わせ
+    () => {
+      const mid = Math.floor(Math.random() * 5) + 3;
+      const p1 = 'loadstring'.substring(0, mid);
+      const p2 = 'loadstring'.substring(mid);
+      return `(_G["${p1}".."${p2}"] or load)`;
+    },
+  ];
+  const chosen = patterns[Math.floor(Math.random() * patterns.length)]();
+  return `local ${vRef}=${chosen}${lite ? ';' : '\n'}`;
+}
+
+/**
+ * XORデコーダを難読化した形で生成
+ * - LCG定数を隠す
+ * - masterSeedを分散
+ * - 変数名はすでにgenerateVarName()で難読化済み
+ */
+
+// ─── 本体: 上記ヘルパーを使ってprocessObfuscationを全面改訂 ───
+
+async function processObfuscation(inputCode, opts) {
+  const TARGET_SIZE = 1.5 * 1024 * 1024;
+  let a = inputCode;
+  const lite = opts.useLite;
+  let adjLayers = opts.layers, adjJunk = opts.junk;
+
+  if (lite) {
+    const estSize = new Blob([inputCode]).size * Math.pow(1.37, opts.layers);
+    if (estSize > TARGET_SIZE) {
+      setObfStatus("軽量化: サイズ調整中...", "process");
+      adjLayers = Math.max(3, Math.floor(Math.log(TARGET_SIZE / new Blob([inputCode]).size) / Math.log(1.37)));
+      adjJunk = Math.min(opts.junk, 80);
       await sleep(50);
     }
   }
-  const XOR_DEPTH=36;
-  let xorDecoder="",vXorVar="";
-  if(opts.useXor){
-    setObfStatus("36層 Chaos XOR暗号化中...","process"); await sleep(20);
-    const masterSeed=Math.floor(Math.random()*99999999)+100000;
-    let cur=masterSeed;
-    const nxt=()=>{cur=(cur*1664525+1013904223)%4294967296;return cur;};
-    const ops=[];
-    for(let i=0;i<XOR_DEPTH;i++){const r=nxt();ops.push({type:Math.floor((r%100)/34),keyBase:Math.floor((r/256)%255)+1,prime:[2,3,5,7,11,13,17,19,23,29,31][Math.floor((r%1000)/100)]||3});}
-    const bytes=new Uint8Array(a.length);
-    for(let i=0;i<a.length;i++) bytes[i]=a.charCodeAt(i);
-    for(let pass=0;pass<XOR_DEPTH;pass++){
-      const{type:tp,keyBase:k,prime:p}=ops[pass];
-      for(let i=0;i<bytes.length;i++){const dk=(k*(i+p))%256;if(tp===0)bytes[i]=bytes[i]^dk;else if(tp===1)bytes[i]=(bytes[i]+dk)%256;else bytes[i]=(bytes[i]-dk+256)%256;}
-      if(pass%5===0)updateObfProgress((pass/XOR_DEPTH)*30);
+
+  const XOR_DEPTH = 36;
+  let xorDecoder = "", vXorVar = "";
+
+  // ── XOR暗号化 (デコーダを難読化して生成) ──
+  if (opts.useXor) {
+    setObfStatus("36層 Chaos XOR暗号化中...", "process"); await sleep(20);
+    const masterSeed = Math.floor(Math.random() * 99999999) + 100000;
+    let cur = masterSeed;
+    const nxt = () => { cur = (cur * 1664525 + 1013904223) % 4294967296; return cur; };
+    const ops = [];
+    for (let i = 0; i < XOR_DEPTH; i++) {
+      const r = nxt();
+      ops.push({ type: Math.floor((r % 100) / 34), keyBase: Math.floor((r / 256) % 255) + 1, prime: [2,3,5,7,11,13,17,19,23,29,31][Math.floor((r % 1000) / 100)] || 3 });
     }
-    let enc="";const cs=32768;
-    for(let i=0;i<bytes.length;i+=cs) enc+=String.fromCharCode.apply(null,bytes.subarray(i,i+cs));
-    a=enc;
-    vXorVar=generateVarName(lite);
-    xorDecoder=`\nlocal function ${vXorVar}(str)\nlocal b={}\nfor i=1,#str do b[i]=string.byte(str,i) end\nlocal s=${masterSeed}\nlocal function n() s=(s*1664525+1013904223)%4294967296 return s end\nlocal ops={}\nlocal pr={2,3,5,7,11,13,17,19,23,29,31}\nfor i=1,${XOR_DEPTH} do\nlocal r=n()\nlocal t=math.floor((r%100)/34)\nlocal k=math.floor((r/256)%255)+1\nlocal p=pr[math.floor((r%1000)/100)+1] or 3\ntable.insert(ops,{t,k,p})\nend\nfor pass=${XOR_DEPTH},1,-1 do\nlocal op=ops[pass]\nlocal t,k,p=op[1],op[2],op[3]\nfor i=1,#b do\nlocal dk=(k*(i+p))%256\nif t==0 then b[i]=bit32.bxor(b[i],dk)\nelseif t==1 then b[i]=(b[i]-dk+256)%256\nelseif t==2 then b[i]=(b[i]+dk)%256 end\nend\nend\nlocal r={}\nfor i=1,#b do r[i]=string.char(b[i]) end\nreturn table.concat(r)\nend\n`;
+    const bytes = new Uint8Array(a.length);
+    for (let i = 0; i < a.length; i++) bytes[i] = a.charCodeAt(i);
+    for (let pass = 0; pass < XOR_DEPTH; pass++) {
+      const { type: tp, keyBase: k, prime: p } = ops[pass];
+      for (let i = 0; i < bytes.length; i++) {
+        const dk = (k * (i + p)) % 256;
+        if (tp === 0) bytes[i] = bytes[i] ^ dk;
+        else if (tp === 1) bytes[i] = (bytes[i] + dk) % 256;
+        else bytes[i] = (bytes[i] - dk + 256) % 256;
+      }
+      if (pass % 5 === 0) updateObfProgress((pass / XOR_DEPTH) * 30);
+    }
+    let enc = ""; const cs = 32768;
+    for (let i = 0; i < bytes.length; i += cs) enc += String.fromCharCode.apply(null, bytes.subarray(i, i + cs));
+    a = enc;
+
+    // ── XORデコーダを難読化して生成 ──
+    const lcg = makeLCGConstants();
+    vXorVar = generateVarName(lite);
+
+    // シードをA*B+C形式に分散
+    const sA = Math.floor(Math.random() * 800) + 100;
+    const sB = Math.floor(masterSeed / sA);
+    const sC = masterSeed - sA * sB;
+
+    // XOR関数本体の変数名を全部ランダムに
+    const v = () => generateVarName(lite);
+    const vStr=v(),vB=v(),vSeed=v(),vNxt=v(),vOps=v(),vPrimes=v(),vI=v(),vR=v(),vTp=v(),vKb=v(),vPr=v(),vPass=v(),vOp=v(),vDk=v(),vOut=v(),vXF=v(),vXA=v(),vXB=v();
+    const sep = lite ? '' : '\n';
+
+    // XOR演算: bit32があれば使う、なければビット演算エミュレート
+    const xorFn = `local ${vXF}=bit32 and bit32.bxor or function(${vXA},${vXB})local _=0;for _i=0,7 do if(math.floor(${vXA}/2^_i)%2)~=(math.floor(${vXB}/2^_i)%2)then _=_+2^_i end end;return _ end${sep}`;
+
+    // LCG: (s * MUL + ADD) % 2^32 — 定数を全て隠す
+    const lcgExpr = `(${vSeed}*${lcg.mul}+${lcg.add})%${lcg.mod}`;
+
+    xorDecoder = `${sep}local function ${vXorVar}(${vStr})${sep}`
+      + `local ${vB}={}${sep}`
+      + `for ${vI}=1,#${vStr} do ${vB}[${vI}]=string.byte(${vStr},${vI}) end${sep}`
+      // シードを分散した式で初期化
+      + `local ${vSeed}=${sA}*${sB}+${sC}${sep}`
+      + xorFn
+      + `local function ${vNxt}() ${vSeed}=${lcgExpr};return ${vSeed} end${sep}`
+      + `local ${vOps}={}${sep}`
+      + `local ${vPrimes}={2,3,5,7,11,13,17,19,23,29,31}${sep}`
+      + `for ${vI}=1,${XOR_DEPTH} do${sep}`
+      + `local ${vR}=${vNxt}()${sep}`
+      + `local ${vTp}=math.floor((${vR}%100)/34)${sep}`
+      + `local ${vKb}=math.floor((${vR}/256)%255)+1${sep}`
+      + `local ${vPr}=${vPrimes}[math.floor((${vR}%1000)/100)+1] or 3${sep}`
+      + `table.insert(${vOps},{${vTp},${vKb},${vPr}})${sep}`
+      + `end${sep}`
+      + `for ${vPass}=${XOR_DEPTH},1,-1 do${sep}`
+      + `local ${vOp}=${vOps}[${vPass}]${sep}`
+      + `local ${vTp},${vKb},${vPr}=${vOp}[1],${vOp}[2],${vOp}[3]${sep}`
+      + `for ${vI}=1,#${vB} do${sep}`
+      + `local ${vDk}=(${vKb}*(${vI}+${vPr}))%256${sep}`
+      + `if ${vTp}==0 then ${vB}[${vI}]=${vXF}(${vB}[${vI}],${vDk})${sep}`
+      + `elseif ${vTp}==1 then ${vB}[${vI}]=(${vB}[${vI}]-${vDk}+256)%256${sep}`
+      + `elseif ${vTp}==2 then ${vB}[${vI}]=(${vB}[${vI}]+${vDk})%256 end${sep}`
+      + `end${sep}`
+      + `end${sep}`
+      + `local ${vOut}={}${sep}`
+      + `for ${vI}=1,#${vB} do ${vOut}[${vI}]=string.char(${vB}[${vI}]) end${sep}`
+      + `return table.concat(${vOut})${sep}`
+      + `end${sep}`;
   }
-  for(let i=0;i<adjLayers;i++){
-    updateObfProgress(30+(i/adjLayers)*60); if(i%5===0) await sleep(10);
-    try{a=btoa(a);}catch(err){const b=new Uint8Array(a.length);for(let j=0;j<a.length;j++)b[j]=a.charCodeAt(j);a=bytesToBase64(b);}
+
+  // ── Base64エンコード ──
+  for (let i = 0; i < adjLayers; i++) {
+    updateObfProgress(30 + (i / adjLayers) * 60);
+    if (i % 5 === 0) await sleep(10);
+    try { a = btoa(a); }
+    catch (err) { const b = new Uint8Array(a.length); for (let j = 0; j < a.length; j++) b[j] = a.charCodeAt(j); a = bytesToBase64(b); }
   }
-  const vLib=generateVarName(lite),vStr=generateVarName(lite),vTbl=generateVarName(lite),vVM=generateVarName(lite),vSt=generateVarName(lite),dv1=generateVarName(lite),dv2=generateVarName(lite),dv3=generateVarName(lite);
-  const b64Decoder=lite
-    ?`local ${dv1}='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/='local ${dv2}={}for ${dv3}=1,#${dv1} do ${dv2}[string.byte(${dv1},${dv3},${dv3})]=${dv3}-1 end local function ${vLib}(s)local r,p,n={},1,#s for i=1,n,4 do local a,b,c,d=${dv2}[string.byte(s,i,i)],${dv2}[string.byte(s,i+1,i+1)],${dv2}[string.byte(s,i+2,i+2)],${dv2}[string.byte(s,i+3,i+3)]if not a or not b then break end r[p]=string.char((a*4+math.floor(b/16))%256)p=p+1 if not c then break end r[p]=string.char(((b%16)*16+math.floor(c/4))%256)p=p+1 if not d then break end r[p]=string.char(((c%4)*64+d)%256)p=p+1 end return table.concat(r)end`
-    :`local ${dv1}='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/='\nlocal ${dv2}={}\nfor ${dv3}=1,#${dv1} do ${dv2}[string.byte(${dv1},${dv3},${dv3})]=${dv3}-1 end\nlocal function ${vLib}(s)local r,p,n={},1,#s\nfor i=1,n,4 do local a,b,c,d=${dv2}[string.byte(s,i,i)],${dv2}[string.byte(s,i+1,i+1)],${dv2}[string.byte(s,i+2,i+2)],${dv2}[string.byte(s,i+3,i+3)]\nif not a or not b then break end\nr[p]=string.char((a*4+math.floor(b/16))%256)p=p+1\nif not c then break end\nr[p]=string.char(((b%16)*16+math.floor(c/4))%256)p=p+1\nif not d then break end\nr[p]=string.char(((c%4)*64+d)%256)p=p+1 end\nreturn table.concat(r)end\n`;
-  let out=lite?'':'-- [[ Dynamic 36-Layer Chaos Obfuscation by YAJU ]] --\n';
-  if(opts.useAntiDump){
+
+  // ── 変数名生成 ──
+  const vLib = generateVarName(lite), vStr = generateVarName(lite), vTbl = generateVarName(lite),
+        vVM  = generateVarName(lite), vSt  = generateVarName(lite);
+  const vAlpha = generateVarName(lite), vParts = generateVarName(lite), vLdRef = generateVarName(lite);
+  const dv3 = generateVarName(lite);
+  const sep = lite ? '' : '\n';
+
+  // ── Base64デコーダを難読化して生成 ──
+  // "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" を隠す
+  const alphaSetup = makeObfuscatedB64Alphabet(vAlpha, vParts, null, lite);
+
+  // Base64デコード関数本体
+  const vMap = generateVarName(lite), vIdx = generateVarName(lite), vS = generateVarName(lite),
+        vRr  = generateVarName(lite), vPp  = generateVarName(lite), vNn = generateVarName(lite),
+        vAa  = generateVarName(lite), vBb  = generateVarName(lite), vCc = generateVarName(lite), vDd = generateVarName(lite);
+
+  const b64Decoder = alphaSetup
+    + `local ${vMap}={}${sep}`
+    + `for ${vIdx}=1,#${vAlpha} do ${vMap}[string.byte(${vAlpha},${vIdx},${vIdx})]=${vIdx}-1 end${sep}`
+    + `local function ${vLib}(${vS})local ${vRr},${vPp},${vNn}={},1,#${vS}${sep}`
+    + `for ${vIdx}=1,${vNn},4 do local ${vAa},${vBb},${vCc},${vDd}=${vMap}[string.byte(${vS},${vIdx},${vIdx})],${vMap}[string.byte(${vS},${vIdx}+1,${vIdx}+1)],${vMap}[string.byte(${vS},${vIdx}+2,${vIdx}+2)],${vMap}[string.byte(${vS},${vIdx}+3,${vIdx}+3)]${sep}`
+    + `if not ${vAa} or not ${vBb} then break end${sep}`
+    + `${vRr}[${vPp}]=string.char((${vAa}*4+math.floor(${vBb}/16))%256)${vPp}=${vPp}+1${sep}`
+    + `if not ${vCc} then break end${sep}`
+    + `${vRr}[${vPp}]=string.char(((${vBb}%16)*16+math.floor(${vCc}/4))%256)${vPp}=${vPp}+1${sep}`
+    + `if not ${vDd} then break end${sep}`
+    + `${vRr}[${vPp}]=string.char(((${vCc}%4)*64+${vDd})%256)${vPp}=${vPp}+1 end${sep}`
+    + `return table.concat(${vRr})end${sep}`;
+
+  // ── loadstring参照を難読化 ──
+  const ldRef = makeLoadstringRef(vLdRef, lite);
+
+  // ── 出力コード組み立て ──
+  // コメントも消す（"by YAJU" などの特徴的な文字列を除去）
+  let out = '';
+
+  if (opts.useAntiDump) {
     const a1=generateVarName(lite),a2=generateVarName(lite),a3=generateVarName(lite);
-    out+=`local function ${a1}()local ${a2}=getfenv()local ${a3}=${a2}[${strToChar("getgenv")}]if ${a3} then ${a3}()[${strToChar("saveinstance")}]=nil ${a3}()[${strToChar("save_instance")}]=nil ${a3}()[${strToChar("dumpstring")}]=nil end if debug then if debug.sethook then pcall(function()debug.sethook(function()while true do end end,"c")end)end if debug.getinfo then debug.getinfo=nil end end end pcall(${a1})`+(lite?'':'\n');
+    out += `local function ${a1}()local ${a2}=getfenv()local ${a3}=${a2}[${strToChar("getgenv")}]if ${a3} then ${a3}()[${strToChar("saveinstance")}]=nil ${a3}()[${strToChar("save_instance")}]=nil ${a3}()[${strToChar("dumpstring")}]=nil end if debug then if debug.sethook then pcall(function()debug.sethook(function()while true do end end,"c")end)end if debug.getinfo then debug.getinfo=nil end end end pcall(${a1})` + sep;
   }
-  if(adjJunk>0) out+=generateMassiveJunkCode(Math.floor(adjJunk/(lite?20:5)),lite,opts);
-  if(opts.useJunkFunc&&!lite){const jfCount=Math.floor(adjJunk/30)+3;for(let i=0;i<jfCount;i++)out+=generateJunkFunction(lite);}
-  out+=b64Decoder+(lite?'':'\n');
-  if(opts.useXor&&xorDecoder) out+=lite?xorDecoder.replace(/\n/g,''):xorDecoder+'\n';
-  if(opts.useShuffle){
-    const chunks=[];for(let i=0;i<a.length;i+=500)chunks.push(a.substring(i,i+500));
-    let arr=chunks.map((v,i)=>({v,i}));
-    for(let i=arr.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[arr[i],arr[j]]=[arr[j],arr[i]];}
-    const vIdx=generateVarName(lite);let tbl='{';arr.forEach(x=>{tbl+=`[${x.i+1}]="${x.v}",`;});tbl+='}';
-    out+=lite?`local ${vTbl}=${tbl}local ${vStr}=""for ${vIdx}=1,${arr.length} do ${vStr}=${vStr}..${vTbl}[${vIdx}]end`:`local ${vTbl}=${tbl}\nlocal ${vStr}=""\nfor ${vIdx}=1,${arr.length} do ${vStr}=${vStr}..${vTbl}[${vIdx}]end\n`;
-  }else{out+=lite?`local ${vStr}="${a}"`:`local ${vStr}="${a}"\n`;}
-  if(opts.useFlat){
-    const steps=[];
-    for(let i=0;i<adjLayers;i++) steps.push(`${vStr}=${vLib}(${vStr})`);
-    if(opts.useXor&&vXorVar) steps.push(`${vStr}=${vXorVar}(${vStr})`);
-    steps.push(`local f=loadstring(${vStr})if f then f()end return`);
-    let vm='{';for(let i=0;i<steps.length;i++)vm+=`[${i}]=function()${steps[i]} return ${i===steps.length-1?-1:i+1}end,`;vm+='}';
-    out+=lite?`local ${vSt}=0 local ${vVM}=${vm}while ${vSt}~=-1 do ${vSt}=${vVM}[${vSt}]()end`:`local ${vSt}=0\nlocal ${vVM}=${vm}\nwhile ${vSt}~=-1 do ${vSt}=${vVM}[${vSt}]()end`;
-  }else{
-    for(let i=0;i<adjLayers;i++) out+=lite?`${vStr}=${vLib}(${vStr})`:`${vStr}=${vLib}(${vStr})\n`;
-    if(opts.useXor&&vXorVar) out+=lite?`${vStr}=${vXorVar}(${vStr})`:`${vStr}=${vXorVar}(${vStr})\n`;
-    out+=`loadstring(${vStr})()`;
+  if (adjJunk > 0) out += generateMassiveJunkCode(Math.floor(adjJunk / (lite ? 20 : 5)), lite, opts);
+  if (opts.useJunkFunc && !lite) { const jfCount = Math.floor(adjJunk / 30) + 3; for (let i = 0; i < jfCount; i++) out += generateJunkFunction(lite); }
+
+  out += b64Decoder + sep;
+  if (opts.useXor && xorDecoder) out += (lite ? xorDecoder.replace(/\n/g, '') : xorDecoder) + sep;
+
+  // loadstring参照を難読化して埋め込む
+  out += ldRef;
+
+  if (opts.useShuffle) {
+    const chunks = []; for (let i = 0; i < a.length; i += 500) chunks.push(a.substring(i, i + 500));
+    let arr = chunks.map((v, i) => ({ v, i }));
+    for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; }
+    const vShIdx = generateVarName(lite);
+    let tbl = '{'; arr.forEach(x => { tbl += `[${x.i+1}]="${x.v}",`; }); tbl += '}';
+    out += lite
+      ? `local ${vTbl}=${tbl}local ${vStr}=""for ${vShIdx}=1,${arr.length} do ${vStr}=${vStr}..${vTbl}[${vShIdx}]end`
+      : `local ${vTbl}=${tbl}\nlocal ${vStr}=""\nfor ${vShIdx}=1,${arr.length} do ${vStr}=${vStr}..${vTbl}[${vShIdx}]end\n`;
+  } else {
+    out += lite ? `local ${vStr}="${a}"` : `local ${vStr}="${a}"\n`;
   }
-  if(adjJunk>100) out=injectJunkIntoCode(out,adjJunk,lite,opts);
-  if(lite) out=minifyCode(out);
-  if(opts.useWrapFunc&&!lite) out=`(function()${out}\nend)()`;
+
+  if (opts.useFlat) {
+    const steps = [];
+    for (let i = 0; i < adjLayers; i++) steps.push(`${vStr}=${vLib}(${vStr})`);
+    if (opts.useXor && vXorVar) steps.push(`${vStr}=${vXorVar}(${vStr})`);
+    // loadstringの呼び出しも難読化参照を使う
+    steps.push(`local f=${vLdRef}(${vStr})if f then f()end return`);
+    let vm = '{'; for (let i = 0; i < steps.length; i++) vm += `[${i}]=function()${steps[i]} return ${i === steps.length - 1 ? -1 : i + 1}end,`; vm += '}';
+    const vVmSt = generateVarName(lite);
+    out += lite
+      ? `local ${vVmSt}=0 local ${vVM}=${vm}while ${vVmSt}~=-1 do ${vVmSt}=${vVM}[${vVmSt}]()end`
+      : `local ${vVmSt}=0\nlocal ${vVM}=${vm}\nwhile ${vVmSt}~=-1 do ${vVmSt}=${vVM}[${vVmSt}]()end`;
+  } else {
+    for (let i = 0; i < adjLayers; i++) out += lite ? `${vStr}=${vLib}(${vStr})` : `${vStr}=${vLib}(${vStr})\n`;
+    if (opts.useXor && vXorVar) out += lite ? `${vStr}=${vXorVar}(${vStr})` : `${vStr}=${vXorVar}(${vStr})\n`;
+    // loadstring() の直接呼び出しを難読化参照に置き換える
+    out += `${vLdRef}(${vStr})()`;
+  }
+
+  if (adjJunk > 100) out = injectJunkIntoCode(out, adjJunk, lite, opts);
+  if (lite) out = minifyCode(out);
+  if (opts.useWrapFunc && !lite) out = `(function()\n${out}\nend)()`;
   return out;
 }
-
 // ════════════════════════════════════════════════════
 //  難読化ボタン
 // ════════════════════════════════════════════════════
