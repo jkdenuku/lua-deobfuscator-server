@@ -908,7 +908,7 @@ async function processObfuscation(inputCode, opts) {
   if (adjJunk > 100) out = injectJunkIntoCode(out, adjJunk, lite, opts);
   if (lite) out = minifyCode(out);
   if (opts.useWrapFunc && !lite) out = `(function()\n${out}\nend)()`;
-  return out;
+  return `-- Obfuscation by YAJU\n${out}`;
 }
 // ════════════════════════════════════════════════════
 //  難読化ボタン
