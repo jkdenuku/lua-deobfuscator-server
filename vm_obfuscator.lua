@@ -89,25 +89,35 @@ local function hide_str(s)
 end
 
 -- ═══════════════════════════════════════════════
---  luac 実行
+--  luac 実行 (修正版: 検出ロジックを強化)
 -- ═══════════════════════════════════════════════
 local tmp_src=os.tmpname()..".lua"
 local tmp_bc =os.tmpname()..".luac"
 do local fw=io.open(tmp_src,"w"); fw:write(source); fw:close() end
 
 local luac_bin=nil
-for _,bin in ipairs({"luac5.1","luac","luajit"}) do
-  if os.execute(bin.." -v > /dev/null 2>&1")==0 or os.execute(bin.." -v > /dev/null 2>&1")==true then
-    luac_bin=bin; break
+for _,bin in ipairs({"luac5.1","luac5.4","luac"}) do
+  local ret = os.execute(bin.." -v 2>/dev/null")
+  io.stderr:write("VM_OBF_DEBUG: trying "..bin.." => "..tostring(ret).."\n")
+  if ret == 0 or ret == true then
+    luac_bin = bin
+    io.stderr:write("VM_OBF_DEBUG: selected luac = "..bin.."\n")
+    break
   end
+end
+if not luac_bin then
+  io.stderr:write("VM_OBF_DEBUG: no luac found, falling back\n")
 end
 
 local bytecode=nil
 if luac_bin then
-  if os.execute(luac_bin.." -o "..tmp_bc.." "..tmp_src.." 2>/dev/null")==0 or
-     os.execute(luac_bin.." -o "..tmp_bc.." "..tmp_src.." 2>/dev/null")==true then
+  local compile_ret = os.execute(luac_bin.." -o "..tmp_bc.." "..tmp_src.." 2>/dev/null")
+  io.stderr:write("VM_OBF_DEBUG: compile ret = "..tostring(compile_ret).."\n")
+  if compile_ret == 0 or compile_ret == true then
     local f2=io.open(tmp_bc,"rb")
-    if f2 then bytecode=f2:read("*a"); f2:close() end
+    if f2 then bytecode=f2:read("*a"); f2:close()
+      io.stderr:write("VM_OBF_DEBUG: bytecode size = "..#bytecode.."\n")
+    end
   end
   os.remove(tmp_bc)
 end
