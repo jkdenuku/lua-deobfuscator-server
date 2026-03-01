@@ -879,7 +879,13 @@ local function unary_fn(opname, fn_name)
 end
 
 arith("ADD","+"); arith("SUB","-"); arith("MUL","*"); arith("DIV","/")
-arith("MOD","%"); arith("POW","^"); arith("IDIV","//")
+arith("MOD","%"); arith("POW","^")
+-- ★ IDIVもLua5.1互換に (// 演算子はLua5.3以上)
+do
+  local va=V(); local vb=V()
+  L(("    elseif %s==%s then local %s=%s;local %s=%s;%s"):format(
+    vOP,opc("IDIV"),vb,pop_expr(),va,pop_expr(),push_expr("math.floor("..va.."/"..vb..")")))
+end
 -- ★ ビット演算はLua5.1互換ヘルパーを使う
 arith_fn("BAND","band"); arith_fn("BOR","bor"); arith_fn("BXOR","bxor")
 arith_fn("SHL","shl"); arith_fn("SHR","shr")
