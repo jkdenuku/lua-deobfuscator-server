@@ -55,13 +55,21 @@ local function ne(n)
 end
 local function hide_str(s)
   if not s or #s==0 then return '""' end
-  local key=(rng()%50)+3
+  -- ★ FIX: keyの最小値を10に増やし、エンコード後に0が出にくくする
+  -- さらに各バイトが1～255の範囲に収まるよう+1オフセットを加える
+  local key=(rng()%40)+10
   local enc={}
-  for i=1,#s do enc[i]=ne((s:byte(i)+key+(i%5)*2)%256) end
+  for i=1,#s do
+    -- ★ FIX: +1 して 1～256 の範囲にし、string.char(0) (ヌル文字) を防ぐ
+    local v = (s:byte(i)+key+(i%5)*2)%255 + 1
+    enc[i]=ne(v)
+  end
   local vt,vr,vi=V(),V(),V()
-  -- BUG FIX: デコード式を (vi%5)*2 に修正（エンコードと同じ式）
-  -- 旧: (%s-1)%%5*2 → i=1でエンコード:2、デコード:0となりズレていた
-  return("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-%d-%s%%5*2+512)%%256)end;return table.concat(%s)end)()"):format(
+  -- デコード: エンコードの逆算 → (enc - 1 - key - (i%5)*2 + 255*N) % 255 が元のバイト値
+  -- enc = (orig + key + (i%5)*2) % 255 + 1
+  -- orig = (enc - 1 - key - (i%5)*2 + 255*N) % 255
+  -- +510 で確実に正の値にする (2*255=510)
+  return("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%5*2+510)%%255)end;return table.concat(%s)end)()"):format(
     vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,key,vi,vr)
 end
 
@@ -699,12 +707,13 @@ if not ok then
   local p3=1
   while p3<=#source do
     local cd=source:sub(p3,p3+CHSZ-1); p3=p3+CHSZ
-    local k3=prng2()%40+5
+    local k3=prng2()%30+10
     local enc={}
-    for i=1,#cd do enc[i]=ne((cd:byte(i)+k3+(i%7)*3)%256) end
+    -- ★ FIX: +1 オフセットでヌル文字回避、%255 で 1～255 の範囲に
+    for i=1,#cd do enc[i]=ne((cd:byte(i)+k3+(i%7)*3)%255+1) end
     local vt,vr,vi=V(),V(),V()
-    -- BUG FIX: フォールバック側も同様に (vi%7)*3 に修正
-    chs[#chs+1]=("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-%d-%s%%7*3+512)%%256)end;return table.concat(%s)end)()"):format(
+    -- ★ FIX: デコード式も対応して修正
+    chs[#chs+1]=("(function()local %s={%s};local %s={};for %s=1,#%s do %s[%s]=string.char((%s[%s]-1-%d-%s%%7*3+510)%%255)end;return table.concat(%s)end)()"):format(
       vt,table.concat(enc,","),vr,vi,vt,vr,vi,vt,vi,k3,vi,vr)
     cvars[#cvars+1]=V()
   end
