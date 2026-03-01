@@ -574,7 +574,7 @@ function generateMassiveJunkCode(count,lite,opts){
     ()=>`local ${generateVarName(lite)}=${encStr(randomString(lite?4:8))};${lite?'':'\n'}`,
     ()=>`local ${generateVarName(lite)}=function()return ${encNum(Math.floor(Math.random()*100))} end;${lite?'':'\n'}`,
     ()=>`local ${generateVarName(lite)}={${Array.from({length:lite?3:5},()=>encNum(Math.floor(Math.random()*100)+1)).join(",")}};${lite?'':'\n'}`,
-    ()=>`if ${Math.random()>.5}then local ${generateVarName(lite)}=nil end;${lite?'':'\n'}`,
+    ()=>`if ${Math.random()>.5} then local ${generateVarName(lite)}=nil end;${lite?'':'\n'}`,
     ()=>`for ${generateVarName(lite)}=1,${encNum(Math.floor(Math.random()*8)+2)} do end;${lite?'':'\n'}`,
     ()=>`while false do local ${generateVarName(lite)}=true;break;end;${lite?'':'\n'}`,
     ()=>`local ${generateVarName(lite)}=math.max(${encNum(Math.floor(Math.random()*50))},${encNum(Math.floor(Math.random()*50))});${lite?'':'\n'}`,
