@@ -709,7 +709,7 @@ app.post('/api/full-obfuscate', async (req, res) => {
 
   // ② Base64 + XOR (Node.js側で実装)
   const XOR_DEPTH = 36;
-  const B64_LAYERS = 12;
+  const B64_LAYERS = 10;
   const JUNK_COUNT = 250;
 
   // XOR暗号化
