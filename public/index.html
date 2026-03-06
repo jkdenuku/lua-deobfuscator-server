@@ -1004,16 +1004,20 @@ async function startDeobfuscation(){
   byId('stepResults').style.display='none'; byId('stepList').innerHTML='';
   const method=document.querySelector('input[name="deobfMethod"]:checked').value;
   setDeobfStatus(`解読中 [${method.toUpperCase()}]...`,"process");
+
+  const YAJU_HEADER = `-- Deobfuscated by YAJU\n`;
+  function addHeader(code){ return code ? YAJU_HEADER + code : code; }
+
   try{
     const res=await fetch('/api/deobfuscate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code,method})});
     const data=await res.json();
     if(method==='auto'&&data.steps){
       renderStepResults(data.steps);
-      byId('deobfOutput').value=data.finalCode||'';
+      byId('deobfOutput').value=addHeader(data.finalCode||'');
       const successCount=data.steps.filter(s=>s.success).length;
       setDeobfStatus(`✓ 解読完了 (${successCount}/${data.steps.length} ステップ成功)`,successCount>0?'success':'error');
     }else if(data.success){
-      byId('deobfOutput').value=data.result||data.finalCode||'';
+      byId('deobfOutput').value=addHeader(data.result||data.finalCode||'');
       renderStepResults([data]); setDeobfStatus("✓ 解読完了！","success");
     }else{
       byId('deobfOutput').value='エラー:\n'+(data.error||'不明なエラー');
