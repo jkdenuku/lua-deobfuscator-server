@@ -290,9 +290,9 @@ function parseDecodedOutputs(stdout) {
     const idx  = parseInt(m[1]);
     const code = m[2];
     if (!code || code.length < 5) continue;
-    // #10: スコアフィルター (30以上のみ採用)
+    // #10: スコアフィルター (15以上のみ採用)
     const score = scoreLuaCode(code);
-    if (score > 30) results.push({ idx, code, score });
+    if (score > 15) results.push({ idx, code, score });
   }
   // スコア順 (高い順) にソート → 最高スコアを best に
   results.sort((a, b) => b.score - a.score);
@@ -1958,8 +1958,8 @@ end
   return new Promise(resolve => {
     fs.writeFileSync(tempFile, wrapper, 'utf8');
 
-    // #25: タイムアウトを 6000ms に変更 (3000→6000)
-    exec(`${luaBin} ${tempFile}`, { timeout: 6000, maxBuffer: 5 * 1024 * 1024 }, (error, stdout, stderr) => {
+    // #25: タイムアウト 3000ms
+    exec(`${luaBin} ${tempFile}`, { timeout: 3000, maxBuffer: 5 * 1024 * 1024 }, (error, stdout, stderr) => {
       try { fs.unlinkSync(tempFile); } catch {}
 
       // #9: __DECODED__ 抽出 (scoreLuaCode フィルター付き #10)
@@ -2043,76 +2043,32 @@ async function autoDeobfuscate(code, _depth) {
     }
   }
 
-  // ══ #2/#3: loaderPatternDetected → dynamicDecode 最優先 ═════════════
+  // ══ loaderPatternDetected チェック ═══════════════════════════════════
   const isLoaderPattern = loaderPatternDetected(current);
   results.push({
     step: 'LoaderPatternCheck', success: true, method: 'loader_pattern',
     loaderPattern: isLoaderPattern,
-    hints: isLoaderPattern ? ['loaderパターン検出 → dynamicDecode優先'] : [],
+    hints: isLoaderPattern ? ['loaderパターン検出'] : [],
   });
 
   let dynDecodedResult = null, dynVmAnalysis = null, wereDevDetected = false;
 
-  if (luaBin) {
-    // ── #2: dynamicDecode を pipeline 最初に ──
-    const dynRes = await dynamicDecode(current);
-    results.push({
-      step: `dynamicDecode${depth > 0 ? ` (再帰${depth})` : ''}`,
-      success: dynRes.success, result: dynRes.result,
-      method: dynRes.method, error: dynRes.error,
-      decodedCount: dynRes.decodedCount,
-      WereDevVMDetected: dynRes.WereDevVMDetected,
-    });
-
-    if (dynRes.success && dynRes.result) {
-      dynDecodedResult = dynRes.result;
-      dynVmAnalysis    = dynRes.vmAnalysis || null;
-      wereDevDetected  = !!(dynRes.WereDevVMDetected || (dynVmAnalysis && dynVmAnalysis.wereDevDetected));
-      current          = dynRes.result;
-      pool.add(current, 'dynamic_decode');
-
-      // #18: decoded.all を CapturePool に追加
-      if (dynRes.allDecoded) {
-        for (const dc of dynRes.allDecoded) pool.add(dc, 'decoded_candidate');
-      }
-
-      // #11: decoded.best がある場合 → 再帰実行で多段loaderを解読
-      if (depth < 3) {
-        const recurseCheck = /loadstring|load\s*\(|table\.concat\s*\(/.test(current);
-        if (recurseCheck) {
-          const recurse = await autoDeobfuscate(current, depth + 1);
-          if (recurse.finalCode && recurse.finalCode !== current) {
-            current = recurse.finalCode;
-            pool.add(current, `recursive_loader_${depth + 1}`);
-            results.push({
-              step: `RecursiveLoader (depth=${depth+1})`, success: true, method: 'recursive_loader',
-              hints: [`多段loader再帰 depth=${depth+1}: ${recurse.steps.length}ステップ`],
-            });
-          }
-        }
-      }
-    }
-  } else {
-    results.push({ step: 'dynamicDecode', success: false,
-      error: 'Luaがインストールされていません', method: 'dynamic_decode' });
-  }
-
-  // ══ #12: pipeline 順序 ══════════════════════════════════════════════
-  //  junk_clean → eval_expressions → char_decoder → xor_decoder
-  //  → constant_array → str_transform → dead_branch
+  // ══ #12: pipeline 先行 (pipeline → dynamicDecode の順) ═══════════════
+  //  junk_clean → char_decoder → constant_array → eval_expressions
+  //  → xor_decoder → str_transform → dead_branch
   // ══════════════════════════════════════════════════════════════════════
   const staticPipeline = [
     ['JunkClean',         junkAssignmentCleaner],
-    ['EvalExpressions',   evaluateExpressions],
     ['CharDecoder',       (c) => staticCharDecoder(c)],   // #13/#14 強化版
-    ['XorDecoder',        xorDecoder],
     ['ConstantArray',     constantArrayResolver],
+    ['EvalExpressions',   evaluateExpressions],
+    ['XorDecoder',        xorDecoder],
     ['StringTransform',   stringTransformDecoder],
     ['DeadBranch',        deadBranchRemover],
   ];
 
-  // #16: maxPasses を 10 に増加
-  const MAX_PASSES = 10;
+  // maxPasses = 5
+  const MAX_PASSES = 5;
   let passChanged = true;
   for (let pass = 0; pass < MAX_PASSES && passChanged; pass++) {
     passChanged = false;
@@ -2137,21 +2093,51 @@ async function autoDeobfuscate(code, _depth) {
     }
   }
 
-  // 静的後 dynamicDecode 再試行
-  if (luaBin && current !== origCode && !dynDecodedResult) {
-    const dynRes2 = await dynamicDecode(current);
-    results.push({ step: 'dynamicDecode (post-static)', ...dynRes2 });
-    if (dynRes2.success && dynRes2.result) {
-      current = dynRes2.result;
-      pool.add(current, 'dynamic_post_static');
-      if (dynRes2.allDecoded) {
-        for (const dc of dynRes2.allDecoded) pool.add(dc, 'decoded_candidate2');
+  // ══ dynamicDecode (pipeline後に実行) ════════════════════════════════
+  if (luaBin) {
+    const dynRes = await dynamicDecode(current);
+    results.push({
+      step: `dynamicDecode${depth > 0 ? ` (再帰${depth})` : ''}`,
+      success: dynRes.success, result: dynRes.result,
+      method: dynRes.method, error: dynRes.error,
+      decodedCount: dynRes.decodedCount,
+      WereDevVMDetected: dynRes.WereDevVMDetected,
+    });
+
+    if (dynRes.success && dynRes.result) {
+      dynDecodedResult = dynRes.result;
+      dynVmAnalysis    = dynRes.vmAnalysis || null;
+      wereDevDetected  = !!(dynRes.WereDevVMDetected || (dynVmAnalysis && dynVmAnalysis.wereDevDetected));
+      current          = dynRes.result;
+      pool.add(current, 'dynamic_decode');
+
+      if (dynRes.allDecoded) {
+        for (const dc of dynRes.allDecoded) pool.add(dc, 'decoded_candidate');
+      }
+
+      // 多段loader再帰 (depth < 5)
+      if (depth < 5) {
+        const recurseCheck = /loadstring|load\s*\(|table\.concat\s*\(/.test(current);
+        if (recurseCheck) {
+          const recurse = await autoDeobfuscate(current, depth + 1);
+          if (recurse.finalCode && recurse.finalCode !== current) {
+            current = recurse.finalCode;
+            pool.add(current, `recursive_loader_${depth + 1}`);
+            results.push({
+              step: `RecursiveLoader (depth=${depth+1})`, success: true, method: 'recursive_loader',
+              hints: [`多段loader再帰 depth=${depth+1}: ${recurse.steps.length}ステップ`],
+            });
+          }
+        }
       }
     }
+  } else {
+    results.push({ step: 'dynamicDecode', success: false,
+      error: 'Luaがインストールされていません', method: 'dynamic_decode' });
   }
 
   // ══ #19: VM検出は dynamicDecode の後にのみ ═══════════════════════════
-  if (!isLoaderPattern) {
+  if (!(isLoaderPattern && scoreLuaCode(current) < 20)) {
     const vmTarget = dynDecodedResult || current;
     const vmRes    = deobfuscateVmify(vmTarget);
 
@@ -2179,7 +2165,7 @@ async function autoDeobfuscate(code, _depth) {
     }
   } else {
     results.push({ step: 'VmDetect (skipped)', success: false,
-      method: 'vm_detect_skipped', error: 'loaderPattern: VM解析スキップ' });
+      method: 'vm_detect_skipped', error: 'loaderPattern && score<20: VM解析スキップ' });
   }
 
   // base64検出
