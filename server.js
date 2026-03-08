@@ -12,15 +12,6 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// グローバルエラーハンドラー
-app.use((err, req, res, next) => {
-  if (err.type === 'entity.too.large') {
-    return res.status(413).json({ success: false, error: 'コードが大きすぎます（最大10MB）' });
-  }
-  console.error('Unhandled error:', err);
-  res.status(500).json({ success: false, error: 'サーバー内部エラー' });
-});
-
 // temp ディレクトリ
 const tempDir = path.join(__dirname, 'temp');
 if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
@@ -56,7 +47,7 @@ app.get('/api/status', (req, res) => {
     status: 'ok',
     lua: checkLuaAvailable() || 'not installed',
     prometheus: checkPrometheusAvailable() ? 'available' : 'not found',
-    deobfuscateMethods: ['auto','advanced_static','eval_expressions','split_strings','xor','constant_array','dynamic','vmify','char_decoder','xor_decoder','math_eval','constant_call','str_transform','dead_branch','junk_clean','vm_detect','vm_extract','base64_detect'],
+    deobfuscateMethods: ['auto', 'xor', 'split_strings', 'encrypt_strings', 'constant_array', 'vmify', 'dynamic'],
     obfuscatePresets:   ['Minify', 'Weak', 'Medium', 'Strong'],
     obfuscateSteps:     ['SplitStrings', 'EncryptStrings', 'ConstantArray', 'ProxifyLocals', 'WrapInFunction', 'Vmify'],
   });
@@ -71,23 +62,12 @@ app.post('/api/deobfuscate', async (req, res) => {
 
   let result;
   switch (method) {
-    case 'xor':             result = xorDecoder(code);                break;
-    case 'split_strings':   result = deobfuscateSplitStrings(code);   break;
+    case 'xor':             result = deobfuscateXOR(code);           break;
+    case 'split_strings':   result = deobfuscateSplitStrings(code);  break;
     case 'encrypt_strings': result = deobfuscateEncryptStrings(code); break;
-    case 'constant_array':  result = constantArrayResolver(code);     break;
-    case 'eval_expressions':result = evaluateExpressions(code);       break;
-    case 'advanced_static': result = advancedStaticDeobfuscate(code); break;
-    case 'char_decoder':    result = charDecoder(code);               break;
-    case 'xor_decoder':     result = xorDecoder(code);                break;
-    case 'math_eval':       result = mathEvaluator(code);             break;
-    case 'constant_call':   result = constantCallEvaluator(code);     break;
-    case 'str_transform':   result = stringTransformDecoder(code);    break;
-    case 'dead_branch':     result = deadBranchRemover(code);         break;
-    case 'junk_clean':      result = junkAssignmentCleaner(code);     break;
-    case 'vm_detect':       result = { ...vmDetector(code), success: vmDetector(code).isVm }; break;
-    case 'vm_extract':      result = vmBytecodeExtractor(code);       break;
-    case 'base64_detect':   result = base64Detector(code, new CapturePool()); break;
-    case 'vmify':           result = deobfuscateVmify(code);          break;
+    case 'constant_array':   result = deobfuscateConstantArray(code);  break;
+    case 'eval_expressions': result = evaluateExpressions(code);      break;
+    case 'vmify':            result = deobfuscateVmify(code);         break;
     case 'dynamic':         result = await tryDynamicExecution(code); break;
     case 'auto':
     default:                result = await autoDeobfuscate(code);    break;
@@ -131,227 +111,141 @@ app.post('/api/vm-obfuscate', async (req, res) => {
 //   3. 多段難読化に対応（動的実行の結果を再帰的に動的実行）
 //   4. アンチダンプ・アンチデバッグを無効化してから実行
 // ════════════════════════════════════════════════════════
-// ════════════════════════════════════════════════════════════════════════
-//  dynamicDecode — #2/#3/#4/#7/#9 統合: loadstring hookedで __DECODED__ dump
-// ════════════════════════════════════════════════════════════════════════
+async function tryDynamicExecution(code) {
+  const luaBin = checkLuaAvailable();
+  if (!luaBin) return { success: false, error: 'Luaがインストールされていません', method: 'dynamic' };
 
-/**
- * #7: loaderPatternDetected — table.concat + string.char + loadstring が揃うか
- */
-// ════════════════════════════════════════════════════════════════════════
-//  BLOCK 1: 前処理 / loaderPattern / safeEnv / hookLoadstring (#1-#18)
-// ════════════════════════════════════════════════════════════════════════
+  const tempFile = path.join(tempDir, `obf_${Date.now()}_${Math.random().toString(36).substring(7)}.lua`);
 
-// ────────────────────────────────────────────────────────────────────────
-//  #1  stripComments — 巨大コメント難読化を削除
-// ────────────────────────────────────────────────────────────────────────
-function stripComments(code) {
-  if (!code) return code;
-  let result = code;
-  // --[[ 長大コメント ]] を削除 (ネスト非対応・実用的な範囲)
-  result = result.replace(/--\[=*\[[\s\S]*?\]=*\]/g, '');
-  // -- 行コメントを削除 (文字列内は除く: 簡易版)
-  result = result.replace(/--[^\[\n][^\n]*/g, '');
-  result = result.replace(/--\n/g, '\n');
-  // 3行以上の連続空行を1行に
-  result = result.replace(/\n{4,}/g, '\n\n');
-  return result.trim();
-}
+  // ]] が含まれる場合のエスケープ
+  const safeCode = code.replace(/\]\]/g, '] ]');
 
-// ────────────────────────────────────────────────────────────────────────
-//  #3  loaderPatternDetected 強化版 — 複合パターン検出
-// ────────────────────────────────────────────────────────────────────────
-function loaderPatternDetected(code) {
-  // パターン1: loadstring + table.concat + string.char
-  const p1 = /table\.concat\s*\(/.test(code) &&
-              /string\.char\s*\(/.test(code) &&
-              /\bloadstring\b|\bload\s*\(/.test(code);
-  // パターン2: load + char table (compact style)
-  const p2 = /\bload\s*\(\s*\{/.test(code) ||
-             (/\bload\s*\(/.test(code) && /\bstring\.char\b/.test(code));
-  // パターン3: 巨大 string.char 連結 (50文字以上)
-  const p3 = /string\.char\s*\(\s*\d[\d\s,]{40,}\)/.test(code);
-  // パターン4: table.concat + number array
-  const p4 = /table\.concat\s*\(\s*\{[\s\d,]+\}/.test(code);
-  return p1 || p2 || p3 || p4;
-}
+  const wrapper = `
+-- ══════════════════════════════════════════
+--  YAJU Deobfuscator - Dynamic Execution Wrapper
+-- ══════════════════════════════════════════
 
-// ────────────────────────────────────────────────────────────────────────
-//  #4/#5  safeEnvPreamble 強化版 — 完全サンドボックス環境
-// ────────────────────────────────────────────────────────────────────────
-const safeEnvPreamble = `
--- ══ YAJU SafeEnv v2 ══
--- os.* を完全無効化
-pcall(function()
-  os.exit    = function() end
-  os.execute = function() return false, "disabled", -1 end
-end)
--- io.* 危険関数を無効化
-pcall(function()
-  io.popen  = function() return nil, "disabled" end
-end)
--- debug.* を無効化
+-- 全キャプチャを格納するテーブル（多段対応）
+local __captures = {}
+local __capture_count = 0
+local __original_loadstring = loadstring or load
+local __original_load = load or loadstring
+
+-- アンチダンプ・アンチデバッグを無効化
 pcall(function()
   if debug then
-    debug.sethook  = function() end
-    debug.getinfo  = nil
-    debug.getlocal = nil; debug.setlocal  = nil
-    debug.getupvalue= nil; debug.setupvalue= nil
-    debug.getmetatable = nil; debug.setmetatable = nil
+    debug.sethook = function() end
+    debug.getinfo = nil
+    debug.getlocal = nil
+    debug.setlocal = nil
+    debug.getupvalue = nil
+    debug.setupvalue = nil
   end
 end)
--- require を制限 (ネットワーク/FFI ライブラリを禁止)
-local __orig_require = require
 pcall(function()
-  require = function(m)
-    local blocked = {socket=1, ffi=1, jit=1, ["io.popen"]=1}
-    if blocked[tostring(m)] then error("require blocked: "..tostring(m)) end
-    return __orig_require(m)
+  if getfenv then
+    local env = getfenv()
+    env.saveinstance = nil
+    env.dumpstring = nil
+    env.save_instance = nil
   end
 end)
--- #5: while true do / repeat until の暴走防止
--- デバッグフックで命令数を制限 (500000命令)
-local __safe_ops = 0
-local __safe_max = 500000
-pcall(function()
-  if debug and debug.sethook then
-    debug.sethook(function()
-      __safe_ops = __safe_ops + 1
-      if __safe_ops > __safe_max then
-        debug.sethook()
-        error("__SAFE_TIMEOUT__", 0)
-      end
-    end, "", 1000)
-  end
-end)
--- ══ SafeEnv End ══
-`;
 
-// ────────────────────────────────────────────────────────────────────────
-//  #6/#7/#8  hookLoadstringCode 強化版 — 全パターンをフック
-// ────────────────────────────────────────────────────────────────────────
-const hookLoadstringCode = `
--- ══ YAJU hookLoadstring v2 ══
-local __orig_ls = loadstring or load
-local __orig_ld = load or loadstring
-local __decoded_count = 0
-local __decoded_best  = nil
-local __decoded_best_len = 0
-
--- #6: 全パターンをフックする共通フック関数
--- #8: local f = __orig_ls(code_str); if f then return f end (二重実行防止)
-local function __hookLoadstring(code_str, name, mode, env)
-  if type(code_str) == "string" and #code_str > 10 then
-    __decoded_count = __decoded_count + 1
-    -- #7: __DECODED__ を stdout に出力 (インデックス付き)
-    io.write("\\n__DECODED_START_" .. tostring(__decoded_count) .. "__\\n")
-    io.write(code_str)
-    io.write("\\n__DECODED_END_" .. tostring(__decoded_count) .. "__\\n")
-    io.flush()
-    if #code_str > __decoded_best_len then
-      __decoded_best     = code_str
-      __decoded_best_len = #code_str
-    end
+-- loadstring / load を完全フック
+local function __hook(code_str, ...)
+  if type(code_str) == "string" and #code_str > 20 then
+    __capture_count = __capture_count + 1
+    __captures[__capture_count] = code_str
   end
-  -- #8: 二重実行防止 — コンパイルのみ、実行は呼び出し元に任せる
-  local f, err
-  if env ~= nil then
-    -- load(code, name, mode, _ENV) パターン (#6)
-    if __orig_ld and __orig_ld ~= __hookLoadstring then
-      f, err = __orig_ld(code_str, name, mode, env)
-    else
-      f, err = __orig_ls(code_str)
-    end
-  else
-    f, err = __orig_ls(code_str)
-  end
-  if f then return f end
-  return nil, err
+  return __original_loadstring(code_str, ...)
 end
 
--- #6: loadstring/load の全パターンを差し替え
-_G.loadstring = __hookLoadstring
-_G.load       = __hookLoadstring
+_G.loadstring = __hook
+_G.load       = __hook
 if rawset then
-  pcall(function() rawset(_G, "loadstring", __hookLoadstring) end)
-  pcall(function() rawset(_G, "load",       __hookLoadstring) end)
+  pcall(function() rawset(_G, "loadstring", __hook) end)
+  pcall(function() rawset(_G, "load", __hook) end)
 end
--- ══ hookLoadstring End ══
+
+-- 難読化コードを実行
+local __obf_code = [[
+${safeCode}
+]]
+
+local __ok, __err = pcall(function()
+  local chunk, err = __original_loadstring(__obf_code)
+  if not chunk then error("parse error: " .. tostring(err)) end
+  chunk()
+end)
+
+-- キャプチャ結果を出力（最後にキャプチャされたものが最も解読されたもの）
+if __capture_count > 0 then
+  -- 最も長い（＝最も展開された）コードを選択
+  local best = __captures[1]
+  for i = 2, __capture_count do
+    if #__captures[i] > #best then best = __captures[i] end
+  end
+  io.write("__CAPTURED_START__")
+  io.write(best)
+  io.write("__CAPTURED_END__")
+  -- 多段情報も出力
+  if __capture_count > 1 then
+    io.write("__LAYERS__:" .. tostring(__capture_count))
+  end
+else
+  io.write("__NO_CAPTURE__")
+  if not __ok then
+    io.write("__ERROR__:" .. tostring(__err))
+  end
+end
 `;
 
-// ────────────────────────────────────────────────────────────────────────
-//  #9/#10  parseDecodedOutputs 強化版 — scoreLuaCodeフィルター付き
-// ────────────────────────────────────────────────────────────────────────
-function parseDecodedOutputs(stdout) {
-  const results = [];
-  const re = /__DECODED_START_(\d+)__\n([\s\S]*?)\n__DECODED_END_\1__/g;
-  let m;
-  while ((m = re.exec(stdout)) !== null) {
-    const idx  = parseInt(m[1]);
-    const code = m[2];
-    if (!code || code.length < 5) continue;
-    // #10: スコアフィルター (30以上のみ採用)
-    const score = scoreLuaCode(code);
-    if (score > 30) results.push({ idx, code, score });
-  }
-  // スコア順 (高い順) にソート → 最高スコアを best に
-  results.sort((a, b) => b.score - a.score);
-  const best = results[0] || null;
-  return { all: results, best: best ? best.code : null };
+  return new Promise(resolve => {
+    fs.writeFileSync(tempFile, wrapper, 'utf8');
+
+    exec(`${luaBin} ${tempFile}`, { timeout: 20000, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+      try { fs.unlinkSync(tempFile); } catch {}
+
+      // キャプチャ成功
+      if (stdout.includes('__CAPTURED_START__') && stdout.includes('__CAPTURED_END__')) {
+        const start    = stdout.indexOf('__CAPTURED_START__') + '__CAPTURED_START__'.length;
+        const end      = stdout.indexOf('__CAPTURED_END__');
+        const captured = stdout.substring(start, end).trim();
+
+        if (captured && captured.length > 5) {
+          // 多段レイヤー数を取得
+          const layerMatch = stdout.match(/__LAYERS__:(\d+)/);
+          const layers = layerMatch ? parseInt(layerMatch[1]) : 1;
+          return resolve({ success: true, result: captured, layers, method: 'dynamic' });
+        }
+      }
+
+      // エラー情報
+      if (stdout.includes('__ERROR__:')) {
+        const errMsg = stdout.split('__ERROR__:')[1] || '';
+        return resolve({ success: false, error: 'Luaエラー: ' + errMsg.substring(0, 300), method: 'dynamic' });
+      }
+
+      if (error && stderr) {
+        return resolve({ success: false, error: '実行エラー: ' + stderr.substring(0, 300), method: 'dynamic' });
+      }
+
+      resolve({ success: false, error: 'loadstring()が呼ばれませんでした（VM系難読化の可能性）', method: 'dynamic' });
+    });
+  });
 }
 
+// ════════════════════════════════════════════════════════
+//  静的解読メソッド群  (全面改訂版)
+// ════════════════════════════════════════════════════════
 
+// ────────────────────────────────────────────────────────
+//  共通ユーティリティ
+// ────────────────────────────────────────────────────────
 
-// ════════════════════════════════════════════════════════════════════════
-//  YAJU Deobfuscator Engine v3
-//  全20項目実装版
-// ════════════════════════════════════════════════════════════════════════
-
-// ────────────────────────────────────────────────────────────────────────
-//  #19  seenCodeCache  — SHA1ハッシュによる重複解析防止
-// ────────────────────────────────────────────────────────────────────────
-const _seenCodeCache = new Map(); // hash -> result
-function cacheHash(code) {
-  return require('crypto').createHash('sha1').update(code).digest('hex');
-}
-function cacheGet(code) { return _seenCodeCache.get(cacheHash(code)) || null; }
-function cacheSet(code, result) {
-  const h = cacheHash(code);
-  if (_seenCodeCache.size > 500) {
-    // LRU簡易: 古いエントリを半分削除
-    const keys = [..._seenCodeCache.keys()].slice(0, 250);
-    keys.forEach(k => _seenCodeCache.delete(k));
-  }
-  _seenCodeCache.set(h, result);
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #20  capturePool  — 解析途中の文字列・コードを蓄積して再利用
-// ────────────────────────────────────────────────────────────────────────
-class CapturePool {
-  constructor() { this.entries = []; }
-  add(code, source) {
-    if (code && code.length > 5 && !this.entries.some(e => e.code === code))
-      this.entries.push({ code, source, ts: Date.now() });
-  }
-  getLuaCandidates() {
-    return this.entries
-      .filter(e => scoreLuaCode(e.code) > 20)
-      .sort((a, b) => scoreLuaCode(b.code) - scoreLuaCode(a.code));
-  }
-  getBest() {
-    const cands = this.getLuaCandidates();
-    return cands.length ? cands[0].code : null;
-  }
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  共通ユーティリティ  (v2から引継ぎ + 拡張)
-// ────────────────────────────────────────────────────────────────────────
+/** Luaコードらしさのスコア */
 function scoreLuaCode(code) {
-  if (!code || typeof code !== 'string') return 0;
-  const keywords = ['local','function','end','if','then','else','return','for','do',
-    'while','and','or','not','nil','true','false','print','table','string','math'];
+  const keywords = ['local','function','end','if','then','else','return','for','do','while','and','or','not','nil','true','false','print','table','string','math'];
   let score = 0;
   keywords.forEach(kw => {
     const m = code.match(new RegExp('\\b' + kw + '\\b', 'g'));
@@ -366,13 +260,6 @@ function scoreLuaCode(code) {
   return score;
 }
 
-function hashCode(str) {
-  let h = 0;
-  for (let i = 0; i < Math.min(str.length, 4096); i++)
-    h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
-  return h.toString(16);
-}
-
 function parseLuaArrayElements(content) {
   const elements = [];
   let cur = '', depth = 0, inStr = false, strChar = '', i = 0;
@@ -383,7 +270,8 @@ function parseLuaArrayElements(content) {
       else if (c === '[' && content[i+1] === '[') {
         let end = content.indexOf(']]', i + 2);
         if (end === -1) end = content.length - 2;
-        cur += content.substring(i, end + 2); i = end + 2; continue;
+        cur += content.substring(i, end + 2);
+        i = end + 2; continue;
       }
       else if (c === '{') { depth++; cur += c; }
       else if (c === '}') { depth--; cur += c; }
@@ -391,7 +279,7 @@ function parseLuaArrayElements(content) {
       else { cur += c; }
     } else {
       if (c === '\\') { cur += c + (content[i+1] || ''); i += 2; continue; }
-      if (c === strChar) inStr = false;
+      if (c === strChar) { inStr = false; }
       cur += c;
     }
     i++;
@@ -402,1834 +290,251 @@ function parseLuaArrayElements(content) {
 
 function resolveLuaStringEscapes(str) {
   return str
-    .replace(/\\n/g,'\n').replace(/\\t/g,'\t').replace(/\\r/g,'\r')
-    .replace(/\\\\/g,'\\').replace(/\\"/g,'"').replace(/\\'/g,"'")
-    .replace(/\\x([0-9a-fA-F]{2})/g,(_,h)=>String.fromCharCode(parseInt(h,16)))
-    .replace(/\\(\d{1,3})/g,(_,d)=>String.fromCharCode(parseInt(d,10)));
+    .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\r/g, '\r')
+    .replace(/\\\\/g, '\\').replace(/\\"/g, '"').replace(/\\'/g, "'")
+    .replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\(\d{1,3})/g, (_, d) => String.fromCharCode(parseInt(d, 10)));
 }
 
-function stripLuaString(tok) {
-  tok = (tok||'').trim();
-  if ((tok.startsWith('"')&&tok.endsWith('"'))||(tok.startsWith("'")&&tok.endsWith("'"))) {
-    try { return resolveLuaStringEscapes(tok.slice(1,-1)); } catch { return null; }
-  }
-  if (tok.startsWith('[[')&&tok.endsWith(']]')) return tok.slice(2,-2);
-  return null;
-}
-
-function splitByComma(src) {
-  const parts=[]; let cur='',depth=0,inStr=false,strCh='';
-  for (let i=0;i<src.length;i++) {
-    const c=src[i];
-    if (!inStr) {
-      if (c==='"'||c==="'") { inStr=true; strCh=c; cur+=c; }
-      else if (c==='('||c==='{'||c==='[') { depth++; cur+=c; }
-      else if (c===')'||c==='}'||c===']') { depth--; cur+=c; }
-      else if (c===','&&depth===0) { parts.push(cur.trim()); cur=''; }
-      else cur+=c;
-    } else {
-      if (c==='\\') { cur+=c+(src[i+1]||''); i++; continue; }
-      if (c===strCh) inStr=false;
-      cur+=c;
-    }
-  }
-  if (cur.trim()) parts.push(cur.trim());
-  return parts;
-}
-
-function splitByConcat(src) {
-  const parts=[]; let cur='',depth=0,inStr=false,strCh=''; let i=0;
-  while (i<src.length) {
-    const c=src[i];
-    if (!inStr) {
-      if (c==='"'||c==="'") { inStr=true; strCh=c; cur+=c; i++; continue; }
-      if (c==='['&&src[i+1]==='[') {
-        let end=src.indexOf(']]',i+2); if (end===-1) end=src.length-2;
-        cur+=src.slice(i,end+2); i=end+2; continue;
-      }
-      if (c==='('||c==='{'||c==='[') { depth++; cur+=c; i++; continue; }
-      if (c===')'||c==='}'||c===']') { depth--; cur+=c; i++; continue; }
-      if (depth===0&&c==='.'&&src[i+1]==='.') {
-        parts.push(cur.trim()); cur=''; i+=2;
-        if (src[i]==='.') i++;
-        continue;
-      }
-    } else {
-      if (c==='\\') { cur+=c+(src[i+1]||''); i+=2; continue; }
-      if (c===strCh) inStr=false;
-    }
-    cur+=c; i++;
-  }
-  if (cur.trim()) parts.push(cur.trim());
-  return parts;
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  Lua数値式パーサー  (evalLuaNumExpr — v2から引継ぎ)
-// ────────────────────────────────────────────────────────────────────────
-function evalLuaNumExpr(expr) {
-  const src=(expr||'').trim(); if (!src) return null;
-  let pos=0;
-  const peek=()=>pos<src.length?src[pos]:'';
-  const consume=()=>pos<src.length?src[pos++]:'';
-  const skipWs=()=>{ while(pos<src.length&&/\s/.test(src[pos]))pos++; };
-  function parseExpr(){ return parseAddSub(); }
-  function parseAddSub(){
-    let l=parseMulDiv(); if(l===null)return null; skipWs();
-    while(peek()==='+' || peek()==='-'){
-      const op=consume(); skipWs(); const r=parseMulDiv(); if(r===null)return null;
-      l=op==='+'?l+r:l-r; skipWs();
-    }
-    return l;
-  }
-  function parseMulDiv(){
-    let l=parsePow(); if(l===null)return null; skipWs();
-    while(peek()==='*'||peek()==='/'||peek()==='%'){
-      const op=consume(); skipWs(); const r=parsePow(); if(r===null)return null;
-      if(op==='*')l=l*r;
-      else if(op==='/'){if(r===0)return null; l=Math.floor(l/r);}
-      else{if(r===0)return null; l=((l%r)+r)%r;}
-      skipWs();
-    }
-    return l;
-  }
-  function parsePow(){
-    let b=parseUnary(); if(b===null)return null; skipWs();
-    if(peek()==='^'){ consume(); skipWs(); const e=parseUnary(); if(e===null)return null; b=Math.pow(b,e); }
-    return b;
-  }
-  function parseUnary(){
-    skipWs();
-    if(peek()==='-'){ consume(); skipWs(); const v=parseAtom(); return v===null?null:-v; }
-    if(peek()==='+') consume();
-    return parseAtom();
-  }
-  function parseAtom(){
-    skipWs();
-    if(peek()==='('){ consume(); const v=parseExpr(); skipWs(); if(peek()===')') consume(); return v; }
-    if(src.startsWith('math.',pos)){
-      pos+=5; let fname='';
-      while(pos<src.length&&/[a-z]/.test(src[pos])) fname+=src[pos++];
-      skipWs(); if(peek()!=='(') return null; consume();
-      const args=[]; skipWs();
-      while(peek()!==')'&&pos<src.length){ const a=parseExpr(); if(a===null)return null; args.push(a); skipWs(); if(peek()===','){consume();skipWs();} }
-      if(peek()===')') consume();
-      if(fname==='floor') return Math.floor(args[0]??0);
-      if(fname==='ceil')  return Math.ceil(args[0]??0);
-      if(fname==='abs')   return Math.abs(args[0]??0);
-      if(fname==='max')   return args.length?Math.max(...args):null;
-      if(fname==='min')   return args.length?Math.min(...args):null;
-      if(fname==='sqrt')  return Math.sqrt(args[0]??0);
-      return null;
-    }
-    if(src[pos]==='0'&&(src[pos+1]==='x'||src[pos+1]==='X')){
-      pos+=2; let h='';
-      while(pos<src.length&&/[0-9a-fA-F]/.test(src[pos])) h+=src[pos++];
-      const n=parseInt(h,16); return isNaN(n)?null:n;
-    }
-    let numStr='';
-    while(pos<src.length&&/[0-9.]/.test(src[pos])) numStr+=src[pos++];
-    if(numStr===''||numStr==='.') return null;
-    const n=parseFloat(numStr); return isNaN(n)?null:n;
-  }
+function evalSimpleExpr(expr) {
   try {
-    const result=parseExpr(); skipWs();
-    if(result===null||!isFinite(result)) return null;
-    if(pos<src.length) return null;
-    return result;
+    const clean = expr.trim();
+    if (!/^[\d\s+\-*/%().]+$/.test(clean)) return null;
+    const result = Function('"use strict"; return (' + clean + ')')();
+    if (typeof result === 'number' && isFinite(result)) return Math.floor(result);
+    return null;
   } catch { return null; }
 }
-function evalSimpleExpr(expr) {
-  const r=evalLuaNumExpr(expr); if(r===null)return null;
-  return Number.isInteger(r)?r:Math.floor(r);
-}
 
-// ────────────────────────────────────────────────────────────────────────
-//  SymbolicEnv  (v2から引継ぎ)
-// ────────────────────────────────────────────────────────────────────────
-class SymbolicEnv {
-  constructor(parent=null){ this.vars=new Map(); this.parent=parent; }
-  get(name){ if(this.vars.has(name))return this.vars.get(name); if(this.parent)return this.parent.get(name); return null; }
-  set(name,entry){ this.vars.set(name,entry); }
-  child(){ return new SymbolicEnv(this); }
-}
-
-function evalStringChar(argsStr,env) {
-  const args=splitByComma(argsStr); const chars=[];
-  for(const a of args){
-    const val=evalExprWithEnv(a.trim(),env);
-    if(val===null||typeof val!=='number') return null;
-    const code=Math.round(val); if(code<0||code>255) return null;
-    chars.push(String.fromCharCode(code));
+// ────────────────────────────────────────────────────────
+//  XOR 解読
+// ────────────────────────────────────────────────────────
+function xorDecryptByte(byte, key) {
+  let result = 0;
+  for (let i = 0; i < 8; i++) {
+    const a = (byte >> i) & 1, b = (key >> i) & 1;
+    if (a !== b) result |= (1 << i);
   }
-  return chars.join('');
+  return result;
 }
 
-function evalArithWithEnv(expr,env){
-  if(!env) return evalLuaNumExpr(expr);
-  let resolved=expr.replace(/\b([a-zA-Z_]\w*)\b/g,(m)=>{
-    if(/^(math)$/.test(m)) return m;
-    const entry=env?env.get(m):null;
-    if(entry&&entry.type==='num') return String(entry.value);
-    return m;
-  });
-  if(/[a-zA-Z_]/.test(resolved.replace(/math\./g,''))) return null;
-  return evalLuaNumExpr(resolved);
-}
-
-function evalExprWithEnv(expr,env){
-  if(!expr) return null; expr=expr.trim();
-  const strVal=stripLuaString(expr); if(strVal!==null) return strVal;
-  if(expr==='true') return 1; if(expr==='false'||expr==='nil') return 0;
-  if(/^[\d\s\+\-\*\/\%\(\)\.\^x0-9a-fA-FxX]+$/.test(expr)||/^[\-\+]?\s*math\./.test(expr)){
-    const n=evalLuaNumExpr(expr); if(n!==null) return n;
+function deobfuscateXOR(code) {
+  const patterns = [/local\s+\w+\s*=\s*\{([0-9,\s]+)\}/g, /\{([0-9,\s]+)\}/g];
+  let encryptedArrays = [];
+  for (const pattern of patterns) {
+    let match;
+    const p = new RegExp(pattern.source, pattern.flags);
+    while ((match = p.exec(code)) !== null) {
+      const nums = match[1].split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n));
+      if (nums.length > 3) encryptedArrays.push(nums);
+    }
+    if (encryptedArrays.length > 0) break;
   }
-  const scMatch=expr.match(/^string\.char\((.+)\)$/s);
-  if(scMatch) return evalStringChar(scMatch[1],env);
-  const tsMatch=expr.match(/^tostring\((.+)\)$/s);
-  if(tsMatch){ const v=evalExprWithEnv(tsMatch[1],env); if(v!==null) return String(v); }
-  const tnMatch=expr.match(/^tonumber\((.+?)(?:,\s*(\d+))?\)$/s);
-  if(tnMatch){
-    const v=evalExprWithEnv(tnMatch[1],env);
-    if(typeof v==='string'){ const base=tnMatch[2]?parseInt(tnMatch[2]):10; const n=parseInt(v,base); if(!isNaN(n)) return n; }
-    if(typeof v==='number') return v;
-  }
-  const repMatch=expr.match(/^string\.rep\((.+?),\s*(\d+)\)$/s);
-  if(repMatch){ const s=evalExprWithEnv(repMatch[1],env); const n=parseInt(repMatch[2]); if(typeof s==='string'&&!isNaN(n)) return s.repeat(n); }
-  const subMatch=expr.match(/^string\.sub\((.+?),\s*(-?\d+)(?:,\s*(-?\d+))?\)$/s);
-  if(subMatch){
-    const s=evalExprWithEnv(subMatch[1],env);
-    if(typeof s==='string'){
-      let i=parseInt(subMatch[2]),j=subMatch[3]!==undefined?parseInt(subMatch[3]):s.length;
-      if(i<0) i=Math.max(0,s.length+i+1); if(j<0) j=s.length+j+1;
-      return s.slice(i-1,j);
+  if (encryptedArrays.length === 0) return { success: false, error: '暗号化配列が見つかりません', method: 'xor' };
+  let bestResult = null, bestScore = -1, bestKey = -1;
+  for (const arr of encryptedArrays) {
+    for (let key = 0; key <= 255; key++) {
+      const str = arr.map(b => String.fromCharCode(xorDecryptByte(b, key))).join('');
+      const score = scoreLuaCode(str);
+      if (score > bestScore) { bestScore = score; bestResult = str; bestKey = key; }
     }
   }
-  const revMatch=expr.match(/^string\.reverse\((.+)\)$/s);
-  if(revMatch){ const s=evalExprWithEnv(revMatch[1],env); if(typeof s==='string') return s.split('').reverse().join(''); }
-  const byteMatch=expr.match(/^string\.byte\((.+?),\s*(\d+)(?:,\s*\d+)?\)$/s);
-  if(byteMatch){ const s=evalExprWithEnv(byteMatch[1],env); const i=parseInt(byteMatch[2]); if(typeof s==='string'&&i>=1&&i<=s.length) return s.charCodeAt(i-1); }
-  const tcMatch=expr.match(/^table\.concat\((\w+)(?:,\s*(.+?))?\)$/s);
-  if(tcMatch&&env){
-    const tbl=env.get(tcMatch[1]);
-    if(tbl&&tbl.type==='table'&&Array.isArray(tbl.value)){
-      const sep=tcMatch[2]?(evalExprWithEnv(tcMatch[2],env)??''):'';
-      if(typeof sep==='string'){
-        const parts=tbl.value.map(v=>typeof v==='string'?v:typeof v==='number'?String(v):null);
-        if(parts.every(p=>p!==null)) return parts.join(sep);
-      }
-    }
-  }
-  const gfMatch=expr.match(/^(?:getfenv\(\)|_G)\s*\[\s*(.+?)\s*\]$/s);
-  if(gfMatch){ const key=evalExprWithEnv(gfMatch[1],env); if(typeof key==='string') return key; }
-  const rawgetMatch=expr.match(/^rawget\s*\(\s*(?:_G|getfenv\(\))\s*,\s*(.+?)\s*\)$/s);
-  if(rawgetMatch){ const key=evalExprWithEnv(rawgetMatch[1],env); if(typeof key==='string') return key; }
-  const concatParts=splitByConcat(expr);
-  if(concatParts.length>1){
-    const resolved=concatParts.map(p=>evalExprWithEnv(p.trim(),env));
-    if(resolved.every(v=>v!==null)) return resolved.map(String).join('');
-  }
-  if(env&&/^\w+$/.test(expr)){ const entry=env.get(expr); if(entry&&(entry.type==='num'||entry.type==='str')) return entry.value; }
-  const arrMatch=expr.match(/^(\w+)\[(.+)\]$/);
-  if(arrMatch&&env){
-    const tbl=env.get(arrMatch[1]);
-    if(tbl&&tbl.type==='table'&&Array.isArray(tbl.value)){
-      const idx=evalExprWithEnv(arrMatch[2],env);
-      if(typeof idx==='number'){ const v=tbl.value[Math.round(idx)-1]; if(v!==undefined) return v; }
-    }
-  }
-  const numResult=evalArithWithEnv(expr,env); if(numResult!==null) return numResult;
-  return null;
+  if (bestScore < 10) return { success: false, error: '有効なLuaコードが見つかりませんでした', method: 'xor' };
+  return { success: true, result: bestResult, key: bestKey, score: bestScore, method: 'xor' };
 }
 
-// ════════════════════════════════════════════════════════════════════════
-//  #1  autoDeobfuscate 処理順は後述 — まず全パスを実装
-// ════════════════════════════════════════════════════════════════════════
-
-// ────────────────────────────────────────────────────────────────────────
-//  #2  evaluateExpressions  — Lua定数式を正規表現で検出して評価
-// ────────────────────────────────────────────────────────────────────────
-function evaluateExpressions(code) {
-  let modified=code, found=false;
-  let prev, iters=0;
-  do {
-    prev=modified;
-    // 括弧内の純粋数値式（文字列外）
-    modified=modified.replace(/\(([^()'"\n]{1,120})\)/g,(match,inner)=>{
-      if(/["']/.test(inner)) return match;
-      const v=evalLuaNumExpr(inner);
-      if(v===null||!Number.isInteger(v)) return match;
-      if(String(v)===inner.trim()) return match;
-      found=true; return String(v);
-    });
-    // 代入右辺の裸の数値算術
-    modified=modified.replace(/(=\s*)([0-9][0-9\s\+\-\*\/\%\^\(\)\.]*[0-9])/g,(match,eq,expr)=>{
-      if(/[a-zA-Z]/.test(expr)) return match;
-      const v=evalLuaNumExpr(expr);
-      if(v===null||!Number.isInteger(v)) return match;
-      if(String(v)===expr.trim()) return match;
-      found=true; return eq+String(v);
-    });
-    // 配列インデックス内の式
-    modified=modified.replace(/\[\s*([0-9][0-9\s\+\-\*\/\%\^\(\)\.]*)\s*\]/g,(match,expr)=>{
-      const v=evalLuaNumExpr(expr); if(v===null||!Number.isInteger(v)) return match;
-      if(String(v)===expr.trim()) return match;
-      found=true; return `[${v}]`;
-    });
-  } while(modified!==prev&&++iters<30);
-  if(!found) return { success:false, error:'評価できる定数式がありませんでした', method:'eval_expressions' };
-  return { success:true, result:modified, method:'eval_expressions' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #3  splitStrings  — 連続文字列連結を1つにまとめる
-// ────────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────
+//  SplitStrings / EncryptStrings / ConstantArray / Eval
+// ────────────────────────────────────────────────────────
 function deobfuscateSplitStrings(code) {
-  let modified=code, found=false;
-  let prev, iters=0;
-  do {
-    prev=modified;
-    // 任意の組み合わせ
-    modified=modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.]*)*)"/g,(_,a,b)=>{ found=true; return `"${a}${b}"`; });
-    modified=modified.replace(/'((?:[^'\\]|\\.)*)'\s*\.\.\s*'((?:[^'\\]|\\.]*)*)'/g,(_,a,b)=>{ found=true; return `'${a}${b}'`; });
-    modified=modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*'((?:[^'\\]|\\.]*)*)'/g,(_,a,b)=>{ found=true; return `"${a}${b}"`; });
-    modified=modified.replace(/'((?:[^'\\]|\\.)*)'\s*\.\.\s*"((?:[^"\\]|\\.]*)*)"/g,(_,a,b)=>{ found=true; return `"${a}${b}"`; });
-  } while(modified!==prev&&++iters<80);
-  if(!found) return { success:false, error:'SplitStringsパターンが見つかりません', method:'split_strings' };
-  return { success:true, result:modified, method:'split_strings' };
+  let modified = code, found = false, iterations = 0;
+  const re1 = /"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g;
+  const re2 = /'((?:[^'\\]|\\.)*)'\s*\.\.\s*'((?:[^'\\]|\\.)*)'/g;
+  while (re1.test(modified) && iterations < 60) {
+    modified = modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g, (_, a, b) => `"${a}${b}"`);
+    found = true; iterations++; re1.lastIndex = 0;
+  }
+  while (re2.test(modified) && iterations < 120) {
+    modified = modified.replace(/'((?:[^'\\]|\\.)*)'\s*\.\.\s*'((?:[^'\\]|\\.)*)'/g, (_, a, b) => `'${a}${b}'`);
+    found = true; iterations++; re2.lastIndex = 0;
+  }
+  if (!found) return { success: false, error: 'SplitStringsパターンが見つかりません', method: 'split_strings' };
+  return { success: true, result: modified, method: 'split_strings' };
 }
 
-// ────────────────────────────────────────────────────────────────────────
-//  #4  charDecoder  — string.char(n,n,...) を文字列へ復元
-// ────────────────────────────────────────────────────────────────────────
-function charDecoder(code, env) {
-  env=env||new SymbolicEnv();
-  let modified=code, found=false;
-  // まず定数式を畳み込む
-  modified=modified.replace(/string\.char\(([^)]+)\)/g,(match,argsStr)=>{
-    const val=evalStringChar(argsStr,env); if(val===null) return match;
-    const esc=val.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r').replace(/\0/g,'\\0');
-    found=true; return `"${esc}"`;
+function deobfuscateEncryptStrings(code) {
+  let modified = code, found = false;
+  modified = modified.replace(/string\.char\(([\d,\s]+)\)/g, (_, nums) => {
+    const chars = nums.split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n) && n >= 0 && n <= 65535);
+    if (chars.length === 0) return _;
+    found = true;
+    return `"${chars.map(c => { const ch = String.fromCharCode(c); return ch === '"' ? '\\"' : ch === '\\' ? '\\\\' : ch; }).join('')}"`;
   });
-  if(!found) return { success:false, error:'string.charパターンが見つかりません', method:'char_decoder' };
-  return { success:true, result:modified, method:'char_decoder' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #5  xorDecoder  — string.char(x^y) や bit.bxor(x,y) パターンのXOR復号
-// ────────────────────────────────────────────────────────────────────────
-function xorDecoder(code) {
-  let modified=code, found=false;
-
-  // string.char(a ~ b) — Lua5.3以降の ~ 演算子
-  modified=modified.replace(/string\.char\((\d+)\s*~\s*(\d+)\)/g,(_,a,b)=>{
-    const v=parseInt(a)^parseInt(b); found=true;
-    return `string.char(${v})`;
-  });
-
-  // bit.bxor(a, b) パターン
-  modified=modified.replace(/bit\.bxor\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)/g,(_,a,b)=>{
-    found=true; return String(parseInt(a)^parseInt(b));
-  });
-
-  // string.char(x ^ y) — Lua5.3 XOR
-  modified=modified.replace(/\b(\d+)\s*\^\s*(\d+)\b/g,(match,a,b)=>{
-    // ^ がべき乗ではなくXORとして使われているかを判断
-    // 両方255以下なら XOR として扱う（べき乗なら結果が大きすぎる）
-    const ia=parseInt(a),ib=parseInt(b);
-    if(ia<=255&&ib<=255){ found=true; return String(ia^ib); }
+  modified = modified.replace(/"((?:\\[0-9]{1,3}|\\x[0-9a-fA-F]{2}|[^"\\])+)"/g, (match, inner) => {
+    if (!/\\[0-9]|\\x/i.test(inner)) return match;
+    try {
+      const decoded = resolveLuaStringEscapes(inner);
+      if ([...decoded].every(c => c.charCodeAt(0) >= 32 && c.charCodeAt(0) <= 126)) {
+        found = true;
+        return `"${decoded.replace(/"/g, '\\"').replace(/\\/g, '\\\\')}"`;
+      }
+    } catch {}
     return match;
   });
-
-  // XOR配列ブルートフォース (既存コード)
-  const xorRes=deobfuscateXOR(code);
-  if(xorRes.success) return { ...xorRes, method:'xor_decoder' };
-
-  if(!found) return { success:false, error:'XORパターンが見つかりません', method:'xor_decoder' };
-  return { success:true, result:modified, method:'xor_decoder' };
+  if (!found) return { success: false, error: 'EncryptStringsパターンが見つかりません', method: 'encrypt_strings' };
+  return { success: true, result: modified, method: 'encrypt_strings' };
 }
 
-// XOR配列ブルートフォース（後方互換）
-function deobfuscateXOR(code) {
-  function xorByte(b,k){ let r=0; for(let i=0;i<8;i++){const a=(b>>i)&1,bk=(k>>i)&1; if(a!==bk)r|=(1<<i);} return r; }
-  const patterns=[/local\s+\w+\s*=\s*\{([0-9,\s]+)\}/g,/\{([0-9,\s]+)\}/g];
-  let encryptedArrays=[];
-  for(const pattern of patterns){
-    let match; const p=new RegExp(pattern.source,pattern.flags);
-    while((match=p.exec(code))!==null){
-      const nums=match[1].split(',').map(n=>parseInt(n.trim())).filter(n=>!isNaN(n));
-      if(nums.length>3) encryptedArrays.push(nums);
-    }
-    if(encryptedArrays.length>0) break;
-  }
-  if(encryptedArrays.length===0) return { success:false, error:'暗号化配列が見つかりません', method:'xor' };
-  let bestResult=null,bestScore=-1,bestKey=-1;
-  for(const arr of encryptedArrays){
-    for(let key=0;key<=255;key++){
-      const str=arr.map(b=>String.fromCharCode(xorByte(b,key))).join('');
-      const score=scoreLuaCode(str);
-      if(score>bestScore){ bestScore=score; bestResult=str; bestKey=key; }
-    }
-  }
-  if(bestScore<10) return { success:false, error:'有効なLuaコードが見つかりませんでした', method:'xor' };
-  return { success:true, result:bestResult, key:bestKey, score:bestScore, method:'xor' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #6  constantArrayResolver  — local t={...} の t[i] を直接値へ置換
-// ────────────────────────────────────────────────────────────────────────
-function constantArrayResolver(code, env) {
-  env=env||new SymbolicEnv();
-  let modified=code, found=false;
-  let passCount=0;
-  while(passCount++<12){
-    let changed=false;
-    const arrayPattern=/local\s+(\w+)\s*=\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}/g;
-    let match; const snapshot=modified;
-    while((match=arrayPattern.exec(snapshot))!==null){
-      const varName=match[1],content=match[2];
-      const elements=parseLuaArrayElements(content);
-      if(elements.length<1) continue;
-      const values=elements.map(e=>{
-        const n=evalLuaNumExpr(e.trim()); if(n!==null) return n;
-        const s=stripLuaString(e.trim()); if(s!==null) return s;
-        return null;
-      });
-      if(values.some(v=>v===null)) continue;
-      env.set(varName,{type:'table',value:values});
-      const esc=varName.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-      const indexRe=new RegExp(esc+'\\[([^\\]]+)\\]','g');
-      modified=modified.replace(indexRe,(fullMatch,indexExpr)=>{
-        const idx=evalExprWithEnv(indexExpr,env);
-        if(idx===null||typeof idx!=='number') return fullMatch;
-        const rounded=Math.round(idx);
-        if(rounded<1||rounded>values.length) return fullMatch;
-        found=true; changed=true;
-        const v=values[rounded-1];
-        if(typeof v==='string') return `"${v.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`;
-        return String(v);
+function deobfuscateConstantArray(code) {
+  let modified = code, found = false;
+  let passCount = 0;
+  while (passCount++ < 10) {
+    let changed = false;
+    const arrayPattern = /local\s+(\w+)\s*=\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\}/g;
+    let match;
+    const snapshot = modified;
+    while ((match = arrayPattern.exec(snapshot)) !== null) {
+      const varName = match[1], content = match[2];
+      const elements = parseLuaArrayElements(content);
+      if (elements.length < 1) continue;
+      const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const indexRe = new RegExp(escaped + '\\[([^\\]]+)\\]', 'g');
+      modified = modified.replace(indexRe, (fullMatch, indexExpr) => {
+        const idx = evalSimpleExpr(indexExpr.trim());
+        if (idx === null || idx < 1 || idx > elements.length) return fullMatch;
+        found = true; changed = true;
+        return elements[idx - 1];
       });
     }
-    if(!changed) break;
+    if (!changed) break;
   }
-  if(!found) return { success:false, error:'ConstantArrayパターンが見つかりません', method:'constant_array' };
-  return { success:true, result:modified, method:'constant_array' };
-}
-// 後方互換
-function deobfuscateConstantArray(code){ return constantArrayResolver(code); }
-
-// ────────────────────────────────────────────────────────────────────────
-//  #7  constantCallEvaluator  — tonumber/tostring の定数呼び出しを変換
-// ────────────────────────────────────────────────────────────────────────
-function constantCallEvaluator(code) {
-  let modified=code, found=false;
-  // tonumber("123") -> 123, tonumber("0xff") -> 255
-  modified=modified.replace(/\btonumber\s*\(\s*"([^"]+)"\s*(?:,\s*(\d+))?\s*\)/g,(_,s,base)=>{
-    const n=parseInt(s,base?parseInt(base):10);
-    if(isNaN(n)) return _;
-    found=true; return String(n);
-  });
-  modified=modified.replace(/\btonumber\s*\(\s*'([^']+)'\s*(?:,\s*(\d+))?\s*\)/g,(_,s,base)=>{
-    const n=parseInt(s,base?parseInt(base):10);
-    if(isNaN(n)) return _;
-    found=true; return String(n);
-  });
-  // tostring(123) -> "123"
-  modified=modified.replace(/\btostring\s*\(\s*(-?\d+(?:\.\d+)?)\s*\)/g,(_,n)=>{
-    found=true; return `"${n}"`;
-  });
-  if(!found) return { success:false, error:'tonumber/tostringの定数呼び出しが見つかりません', method:'constant_call' };
-  return { success:true, result:modified, method:'constant_call' };
+  if (!found) return { success: false, error: 'ConstantArrayパターンが見つかりません', method: 'constant_array' };
+  return { success: true, result: modified, method: 'constant_array' };
 }
 
-// ────────────────────────────────────────────────────────────────────────
-//  #8  mathEvaluator  — math.* の引数が定数なら結果に置換
-// ────────────────────────────────────────────────────────────────────────
-function mathEvaluator(code) {
-  let modified=code, found=false;
-  const fns=['floor','ceil','abs','sqrt','max','min'];
-  for(const fn of fns){
-    const re=new RegExp(`math\\.${fn}\\s*\\(([^)]+)\\)`,'g');
-    modified=modified.replace(re,(match,args)=>{
-      const argList=splitByComma(args).map(a=>evalLuaNumExpr(a.trim()));
-      if(argList.some(v=>v===null)) return match;
-      let result;
-      if(fn==='floor') result=Math.floor(argList[0]);
-      else if(fn==='ceil') result=Math.ceil(argList[0]);
-      else if(fn==='abs') result=Math.abs(argList[0]);
-      else if(fn==='sqrt') result=Math.sqrt(argList[0]);
-      else if(fn==='max') result=Math.max(...argList);
-      else if(fn==='min') result=Math.min(...argList);
-      if(result===undefined||!isFinite(result)) return match;
-      found=true;
-      return Number.isInteger(result)?String(result):result.toFixed(6);
+function evaluateExpressions(code) {
+  let modified = code, found = false;
+  let prev, iters = 0;
+  do {
+    prev = modified;
+    modified = modified.replace(/\(\s*([\d.]+)\s*([\+\-\*\/\%])\s*([\d.]+)\s*\)/g, (_, a, op, b) => {
+      const result = evalSimpleExpr(`${a}${op}${b}`);
+      if (result === null) return _;
+      found = true; return String(result);
     });
+  } while (modified !== prev && ++iters < 20);
+  modified = modified.replace(/\[\s*([\d\s+\-*\/%().]+)\s*\]/g, (match, expr) => {
+    const result = evalSimpleExpr(expr);
+    if (result === null) return match;
+    found = true; return `[${result}]`;
+  });
+  let concatIter = 0;
+  while (/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g.test(modified) && concatIter++ < 40) {
+    modified = modified.replace(/"((?:[^"\\]|\\.)*)"\s*\.\.\s*"((?:[^"\\]|\\.)*)"/g, (_, a, b) => { found = true; return `"${a}${b}"`; });
   }
-  if(!found) return { success:false, error:'math.*の定数呼び出しが見つかりません', method:'math_eval' };
-  return { success:true, result:modified, method:'math_eval' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #9  deadBranchRemover  — if true/false の不要分岐を削除
-// ────────────────────────────────────────────────────────────────────────
-function deadBranchRemover(code) {
-  let modified=code, found=false;
-  // if true then ... end  → 中身だけ残す
-  modified=modified.replace(/\bif\s+true\s+then\s+([\s\S]*?)\s*end\b/g,(_,body)=>{ found=true; return body.trim(); });
-  // if false then ... end  → 完全削除
-  modified=modified.replace(/\bif\s+false\s+then\s+[\s\S]*?\s*end\b/g,()=>{ found=true; return ''; });
-  // if true then ... else ... end → then節だけ残す
-  modified=modified.replace(/\bif\s+true\s+then\s+([\s\S]*?)\s*else\s+[\s\S]*?\s*end\b/g,(_,thenPart)=>{ found=true; return thenPart.trim(); });
-  // if false then ... else ... end → else節だけ残す
-  modified=modified.replace(/\bif\s+false\s+then\s+[\s\S]*?\s*else\s+([\s\S]*?)\s*end\b/g,(_,elsePart)=>{ found=true; return elsePart.trim(); });
-  // while false do ... end → 削除
-  modified=modified.replace(/\bwhile\s+false\s+do\s+[\s\S]*?\s*end\b/g,()=>{ found=true; return ''; });
-  // repeat ... until true → 1回実行（内容だけ残す）
-  modified=modified.replace(/\brepeat\s+([\s\S]*?)\s*until\s+true\b/g,(_,body)=>{ found=true; return body.trim(); });
-  if(!found) return { success:false, error:'デッドブランチが見つかりません', method:'dead_branch' };
-  return { success:true, result:modified, method:'dead_branch' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #10  junkAssignmentCleaner  — 無意味代入・自己代入を削除
-// ────────────────────────────────────────────────────────────────────────
-function junkAssignmentCleaner(code) {
-  let modified=code, found=false;
-  // local a = a  (自己代入)
-  modified=modified.replace(/local\s+(\w+)\s*=\s*\1\s*[\n;]/g,(_,name)=>{ found=true; return ''; });
-  // local _ = ... (アンダースコア変数への代入)
-  modified=modified.replace(/local\s+_\s*=\s*[^\n;]+[\n;]/g,()=>{ found=true; return ''; });
-  // 連続する空行を1行に圧縮
-  modified=modified.replace(/\n{3,}/g,'\n\n');
-  if(!found) return { success:false, error:'ジャンク代入が見つかりません', method:'junk_clean' };
-  return { success:true, result:modified, method:'junk_clean' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #11  duplicateConstantReducer  — 重複定数を1つにまとめる
-// ────────────────────────────────────────────────────────────────────────
-function duplicateConstantReducer(code) {
-  let modified=code, found=false;
-  // 同じ string.char(...) が3回以上出現する場合に変数化
-  const scMap=new Map();
-  modified.replace(/string\.char\([^)]+\)/g,m=>{ scMap.set(m,(scMap.get(m)||0)+1); });
-  for(const [expr,count] of scMap) {
-    if(count<3) continue;
-    const varName=`_sc${Math.abs(hashCode(expr)&0xffff).toString(16)}`;
-    // 変数宣言を先頭に追加し、使用箇所を置換
-    const escapedExpr=expr.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-    const re=new RegExp(escapedExpr,'g');
-    if(re.test(modified)){
-      modified=`local ${varName}=${expr}\n`+modified.replace(re,varName);
-      found=true;
-    }
-  }
-  if(!found) return { success:false, error:'重複定数が見つかりません', method:'dup_reduce' };
-  return { success:true, result:modified, method:'dup_reduce' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #12  sandboxFilter  — 危険関数除去 + サイズ制限
-// ────────────────────────────────────────────────────────────────────────
-const MAX_DYNAMIC_SIZE = 512 * 1024; // 512KB
-const DANGEROUS_PATTERNS = [
-  /\bos\.execute\s*\(/g,
-  /\bio\.popen\s*\(/g,
-  /\bio\.open\s*\([^,)]+,\s*["']w/g,
-  /\brequire\s*\(\s*["']socket/g,
-  /\bloadfile\s*\(/g,
-  /\bdofile\s*\(/g,
-  /\bpackage\.loadlib\s*\(/g,
-];
-function sandboxFilter(code) {
-  if(code.length>MAX_DYNAMIC_SIZE)
-    return { safe:false, reason:`コードが大きすぎます (${(code.length/1024).toFixed(1)}KB > 512KB)`, code };
-  let filtered=code;
-  const removed=[];
-  for(const pat of DANGEROUS_PATTERNS){
-    if(pat.test(filtered)){
-      filtered=filtered.replace(pat,m=>{ removed.push(m.replace(/\(/,'')); return '--[[REMOVED]]--'; });
-      pat.lastIndex=0;
-    }
-  }
-  return { safe:true, code:filtered, removed };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #14  vmDetector  — while true do opcode=... のVMパターン検出
-// ────────────────────────────────────────────────────────────────────────
-// ════════════════════════════════════════════════════════════════════════
-//  BLOCK 2: vmDetector強化 / vmHookBootstrap / injectVmHook (#19-#33)
-// ════════════════════════════════════════════════════════════════════════
-
-// ────────────────────────────────────────────────────────────────────────
-//  #20-#22  vmDetector 強化版 — MoonSec / Luraph / WereDev 検出
-// ────────────────────────────────────────────────────────────────────────
-function vmDetector(code) {
-  const hints = [];
-
-  // ── WereDev (#22) ──────────────────────────────────────────────────
-  const weredevPatterns = [
-    { re: /bytecode\s*\[\s*ip\s*\]/,                                  desc: 'WereDev: bytecode[ip]' },
-    { re: /dispatch\s*\[\s*inst\s*\[\s*1\s*\]\s*\]/,                 desc: 'WereDev: dispatch[inst[1]]' },
-    { re: /\bvm_loop\b/,                                              desc: 'WereDev: vm_loop' },
-    { re: /while\s+true\s+do[\s\S]{0,400}bytecode\s*\[\s*ip\s*\]/i,  desc: 'WereDev: while-true+bytecode[ip]' },
-    { re: /local\s+inst\s*=\s*bytecode\s*\[\s*ip\s*\]/,              desc: 'WereDev: local inst=bytecode[ip]' },
-    { re: /inst\s*\[\s*1\s*\]/,                                       desc: 'WereDev: inst[1]' },
-    { re: /ip\s*=\s*ip\s*\+\s*1/,                                    desc: 'WereDev: ip+1' },
-  ];
-
-  // ── MoonSec (#20) ──────────────────────────────────────────────────
-  const moonSecPatterns = [
-    { re: /MoonSec/,                                                  desc: 'MoonSec: MoonSec識別子' },
-    { re: /MSVM/,                                                     desc: 'MoonSec: MSVM' },
-    { re: /_ENV\s*\[.+\]/,                                            desc: 'MoonSec: _ENV[key]アクセス' },
-    { re: /dispatch\s*\[opcode\]/,                                    desc: 'MoonSec: dispatch[opcode]' },
-    { re: /stk\s*\[top\]|stk\s*\[top\s*-/,                          desc: 'MoonSec: stack top操作' },
-  ];
-
-  // ── Luraph (#21) ───────────────────────────────────────────────────
-  const luraphPatterns = [
-    { re: /LPH_String/,                                               desc: 'Luraph: LPH_String' },
-    { re: /LPH_GetEnv/,                                               desc: 'Luraph: LPH_GetEnv' },
-    { re: /LPH_JIT/,                                                  desc: 'Luraph: LPH_JIT' },
-    { re: /\bLPH\b/,                                                  desc: 'Luraph: LPH識別子' },
-  ];
-
-  // ── 汎用VM ─────────────────────────────────────────────────────────
-  const genericPatterns = [
-    { re: /while\s+true\s+do[\s\S]{0,200}opcode/i,  desc: 'generic: while-true opcode' },
-    { re: /\bopcode\b.*\bInstructions\b/s,           desc: 'generic: opcode+Instructions' },
-    { re: /local\s+\w+\s*=\s*Instructions\s*\[/,    desc: 'generic: Instructions配列' },
-    { re: /\bProto\b[\s\S]{0,100}\bupValues\b/s,     desc: 'generic: Proto/upValues' },
-    { re: /\bVStack\b|\bVEnv\b|\bVPC\b/,             desc: 'generic: 仮想スタック' },
-    { re: /if\s+opcode\s*==\s*\d+\s*then/,           desc: 'generic: opcodeディスパッチ' },
-    { re: /\{(\s*\d+\s*,){20,}/,                     desc: 'generic: 大規模数値テーブル' },
-    { re: /\bbit\.bxor\b|\bbit\.band\b|\bbit32\./,   desc: 'generic: ビット演算' },
-  ];
-
-  let weredevScore = 0;
-  let moonSecScore = 0;
-  let luraphScore  = 0;
-
-  for (const p of weredevPatterns) {
-    if (p.re.test(code)) { hints.push(p.desc); weredevScore++; }
-  }
-  for (const p of moonSecPatterns) {
-    if (p.re.test(code)) { hints.push(p.desc); moonSecScore++; }
-  }
-  for (const p of luraphPatterns) {
-    if (p.re.test(code)) { hints.push(p.desc); luraphScore++; }
-  }
-  if (/return\s*\(function\s*\([^)]*\)/s.test(code)) hints.push('自己実行関数ラッパー');
-  for (const p of genericPatterns) {
-    if (p.re.test(code)) hints.push(p.desc);
-  }
-
-  const strings = [];
-  const strPattern = /"([^"\\]{4,}(?:\\.[^"\\]*)*)"/g;
-  let ms;
-  while ((ms = strPattern.exec(code)) !== null) {
-    if (ms[1].length > 4) strings.push(ms[1]);
-  }
-  if (strings.length > 0) hints.push(`${strings.length}件の文字列`);
-
-  const isWereDev  = weredevScore >= 2;
-  const isMoonSec  = moonSecScore >= 2;
-  const isLuraph   = luraphScore  >= 1;
-  const isVm       = hints.length >= 2;
-
-  return { isVm, isWereDev, isMoonSec, isLuraph,
-    weredevScore, moonSecScore, luraphScore,
-    hints, strings: strings.slice(0, 50), method: 'vm_detect' };
+  if (!found) return { success: false, error: '評価できる式がありませんでした', method: 'eval_expressions' };
+  return { success: true, result: modified, method: 'eval_expressions' };
 }
 
 function deobfuscateVmify(code) {
-  const r = vmDetector(code);
-  if (!r.isVm && r.hints.length === 0)
-    return { success: false, error: 'VMパターンが検出されませんでした', method: 'vmify' };
-  const vmType = r.isWereDev ? 'WereDev' : r.isMoonSec ? 'MoonSec' : r.isLuraph ? 'Luraph' : 'Generic';
-  return { success: true, result: code, hints: r.hints, strings: r.strings,
-    isWereDev: r.isWereDev, isMoonSec: r.isMoonSec, isLuraph: r.isLuraph,
-    vmType, weredevScore: r.weredevScore,
-    warning: `${vmType} VM検出 — 動的実行+フック解析を推奨`, method: 'vmify' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #26/#27/#28/#29  vmHookBootstrap 強化版
-// ────────────────────────────────────────────────────────────────────────
-const vmHookBootstrap = `
--- ══ YAJU VM Hook Bootstrap v2 ══
-__vm_logs     = {}
-__vm_log_count = 0
-__vm_max_logs  = 5000   -- #27: 2000→5000に増加
-
--- #28: ip opcode arg1 arg2 を __VMLOG__ プレフィックスで出力
--- #29: type(inst) ~= "table" ガード追加
-function __vmhook(ip, inst, stack, reg)
-  if __vm_log_count >= __vm_max_logs then return end
-  __vm_log_count = __vm_log_count + 1
-  -- #29: inst が table でなければ早期リターン
-  if inst ~= nil and type(inst) ~= "table" and type(inst) ~= "number" then return end
-  local entry = { ip = ip, ts = __vm_log_count }
-  if type(inst) == "table" then
-    -- #29: type check 追加
-    if type(inst[1]) ~= "nil" then entry.op   = inst[1] end
-    if type(inst[2]) ~= "nil" then entry.arg1 = inst[2] end
-    if type(inst[3]) ~= "nil" then entry.arg2 = inst[3] end
-    if type(inst[4]) ~= "nil" then entry.arg3 = inst[4] end
-  elseif type(inst) == "number" then
-    entry.op = inst
-  end
-  table.insert(__vm_logs, entry)
-end
--- ══ Bootstrap End ══
-`;
-
-// ────────────────────────────────────────────────────────────────────────
-//  #28  vmDumpFooter — __VMLOG__ 形式で stdout に出力
-// ────────────────────────────────────────────────────────────────────────
-const vmDumpFooter = `
--- ══ YAJU VM Dump Footer v2 ══
-if __vm_log_count and __vm_log_count > 0 then
-  -- #28: ip\topcode\targ1\targ2 形式
-  for i, v in ipairs(__vm_logs) do
-    local op   = tostring(v.op   or "nil")
-    local arg1 = tostring(v.arg1 or "nil")
-    local arg2 = tostring(v.arg2 or "nil")
-    local arg3 = tostring(v.arg3 or "nil")
-    print("__VMLOG__\t" .. tostring(v.ip) .. "\t" .. op .. "\t" .. arg1 .. "\t" .. arg2 .. "\t" .. arg3)
-  end
-  print("__VMLOG_END__\t" .. tostring(__vm_log_count))
-end
--- ══ Dump End ══
-`;
-
-// ────────────────────────────────────────────────────────────────────────
-//  #24/#30/#31/#32/#33  injectVmHook 強化版
-//  — WereDev/MoonSec/Luraph それぞれに対応した注入
-// ────────────────────────────────────────────────────────────────────────
-function injectVmHook(code, vmInfo) {
-  let modified = code;
-  let injected  = false;
-  const type_   = vmInfo || {};
-
-  // #30: while true do / repeat until の直後に __vmhook を挿入
-  // #24: パターンを /while\s+true\s+do|repeat\s+until/ に拡張
-  modified = modified.replace(
-    /(while\s+true\s+do\s*\n)/g,
-    (match) => { injected = true; return match + '  __vmhook(ip, inst, stack, reg)\n'; }
-  );
-  modified = modified.replace(
-    /(repeat\s*\n)/g,
-    (match) => { injected = true; return match + '  __vmhook(ip, inst, stack, reg)\n'; }
-  );
-
-  // #31: WereDev — bytecode[ip] 実行前に hook を挿入
-  if (!injected || type_.isWereDev) {
-    modified = modified.replace(
-      /(local\s+inst\s*=\s*bytecode\s*\[\s*ip\s*\][^\n]*\n)/g,
-      (match) => { injected = true; return match + '  __vmhook(ip, inst)\n'; }
-    );
-  }
-
-  // #32: MoonSec — dispatch[opcode] 呼び出し前に hook を挿入
-  if (!injected || type_.isMoonSec) {
-    modified = modified.replace(
-      /(dispatch\s*\[\s*opcode\s*\]\s*\()/g,
-      (match) => { injected = true; return `__vmhook(ip, opcode); ` + match; }
-    );
-    modified = modified.replace(
-      /(dispatch\s*\[\s*inst\s*\[\s*1\s*\]\s*\]\s*\()/g,
-      (match) => { injected = true; return `__vmhook(ip, inst); ` + match; }
-    );
-  }
-
-  // #33: Luraph — LPH_GetEnv 呼び出しをフック
-  if (type_.isLuraph) {
-    modified = modified.replace(
-      /\bLPH_GetEnv\s*\(/g,
-      (match) => { injected = true; return `__vmhook(0, "LPH_GetEnv"); ` + match; }
-    );
-    modified = modified.replace(
-      /\bLPH_String\s*\(/g,
-      (match) => { injected = true; return `__vmhook(0, "LPH_String"); ` + match; }
-    );
-  }
-
-  // 汎用フォールバック: local opcode = の次行
-  if (!injected) {
-    modified = modified.replace(
-      /(local\s+opcode\s*=\s*[^\n]+\n)/g,
-      (match) => { injected = true; return match + '  __vmhook(ip, opcode)\n'; }
-    );
-  }
-
-  return { code: modified, injected };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  runLuaWithHooks  (#26: vmHookBootstrap を先頭に注入)
-// ────────────────────────────────────────────────────────────────────────
-function runLuaWithHooks(code) {
-  return vmHookBootstrap + '\n' + code + '\n' + vmDumpFooter;
-}
-
-
-// ════════════════════════════════════════════════════════════════════════
-//  BLOCK 3: VMログ解析 / 逆コンパイラ (#34-#54)
-// ════════════════════════════════════════════════════════════════════════
-
-// ────────────────────────────────────────────────────────────────────────
-//  #34/#35  parseVmLogs 強化版 — split("\t") で構造化
-// ────────────────────────────────────────────────────────────────────────
-function parseVmLogs(stdout) {
-  const vmTrace = [];
-  const lines = stdout.split('\n');
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('__VMLOG__')) continue;
-    // #35: split("\t") で ip opcode arg1 arg2 を構造化
-    const parts = trimmed.split('\t');
-    if (parts.length < 3) continue;
-    const ip   = parseInt(parts[1]) || 0;
-    const op   = parts[2] !== 'nil' ? (isNaN(Number(parts[2])) ? parts[2] : parseInt(parts[2])) : null;
-    const arg1 = parts[3] !== undefined && parts[3] !== 'nil'
-      ? (isNaN(Number(parts[3])) ? parts[3] : parseInt(parts[3])) : null;
-    const arg2 = parts[4] !== undefined && parts[4] !== 'nil'
-      ? (isNaN(Number(parts[4])) ? parts[4] : parseInt(parts[4])) : null;
-    const arg3 = parts[5] !== undefined && parts[5] !== 'nil'
-      ? (isNaN(Number(parts[5])) ? parts[5] : parseInt(parts[5])) : null;
-    vmTrace.push({ ip, op, arg1, arg2, arg3 });
-  }
-  return vmTrace;
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #36  saveVmTrace — vmトレースをJSONとして保存
-// ────────────────────────────────────────────────────────────────────────
-function saveVmTrace(vmTrace, suffix) {
-  if (!vmTrace || vmTrace.length === 0) return null;
-  try {
-    const fname = path.join(tempDir, `vm_trace_${suffix || Date.now()}.json`);
-    fs.writeFileSync(fname, JSON.stringify(vmTrace, null, 2), 'utf8');
-    return fname;
-  } catch { return null; }
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #37/#38/#39  vmTraceAnalyzer 強化版 — dispatch table推定 + 挙動推定
-// ────────────────────────────────────────────────────────────────────────
-const LUA51_OPCODES = {
-  0:'MOVE',1:'LOADK',2:'LOADBOOL',3:'LOADNIL',4:'GETUPVAL',
-  5:'GETGLOBAL',6:'GETTABLE',7:'SETGLOBAL',8:'SETUPVAL',9:'SETTABLE',
-  10:'NEWTABLE',11:'SELF',12:'ADD',13:'SUB',14:'MUL',
-  15:'DIV',16:'MOD',17:'POW',18:'UNM',19:'NOT',
-  20:'LEN',21:'CONCAT',22:'JMP',23:'EQ',24:'LT',
-  25:'LE',26:'TEST',27:'TESTSET',28:'CALL',29:'TAILCALL',
-  30:'RETURN',31:'FORLOOP',32:'FORPREP',33:'TFORLOOP',34:'SETLIST',
-  35:'CLOSE',36:'CLOSURE',37:'VARARG',
-};
-
-// opcode挙動カテゴリ
-const OPCODE_CATEGORIES = {
-  MOVE:'MOVE', LOADK:'CONST', LOADBOOL:'CONST', LOADNIL:'CONST',
-  GETUPVAL:'LOAD', GETGLOBAL:'LOAD', GETTABLE:'LOAD',
-  SETGLOBAL:'STORE', SETUPVAL:'STORE', SETTABLE:'STORE',
-  NEWTABLE:'TABLE', SELF:'TABLE',
-  ADD:'ARITH', SUB:'ARITH', MUL:'ARITH', DIV:'ARITH', MOD:'ARITH', POW:'ARITH',
-  UNM:'ARITH', NOT:'ARITH', LEN:'ARITH', CONCAT:'ARITH',
-  JMP:'JUMP', EQ:'JUMP', LT:'JUMP', LE:'JUMP', TEST:'JUMP', TESTSET:'JUMP',
-  CALL:'CALL', TAILCALL:'CALL', RETURN:'RETURN',
-  FORLOOP:'LOOP', FORPREP:'LOOP', TFORLOOP:'LOOP',
-  SETLIST:'TABLE', CLOSE:'CLOSE', CLOSURE:'CLOSURE', VARARG:'VARARG',
-};
-
-function vmTraceAnalyzer(vmTrace) {
-  if (!vmTrace || vmTrace.length === 0)
-    return { success: false, error: 'vmTraceが空', opcodeMap: {} };
-
-  // #37: opcode頻度カウント
-  const freq = {};
-  for (const e of vmTrace) {
-    if (e.op === null || e.op === undefined) continue;
-    const k = String(e.op);
-    freq[k] = (freq[k] || 0) + 1;
-  }
-  const sorted = Object.entries(freq)
-    .sort((a, b) => b[1] - a[1])
-    .map(([op, count]) => ({ op: isNaN(Number(op)) ? op : parseInt(op), count }));
-
-  // #38: dispatch table推定 — opcodeと名前のマッピング
-  const dispatchTable = {};
-  for (const { op } of sorted) {
-    const n = parseInt(op);
-    if (!isNaN(n) && LUA51_OPCODES[n]) dispatchTable[op] = LUA51_OPCODES[n];
-  }
-
-  // opcodeExecutionMap (名前付き)
-  const opcodeExecutionMap = {};
-  for (const [num, name] of Object.entries(LUA51_OPCODES)) {
-    const entries = vmTrace.filter(t => String(t.op) === String(num));
-    if (entries.length > 0) {
-      opcodeExecutionMap[name] = {
-        opcode: parseInt(num), count: entries.length,
-        category: OPCODE_CATEGORIES[name] || 'UNKNOWN',
-        sampleArgs: entries.slice(0, 3).map(e => [e.arg1, e.arg2, e.arg3]),
-      };
-    }
-  }
-
-  // #39: カテゴリ別挙動推定
-  const behaviorSummary = {};
-  for (const [name, info] of Object.entries(opcodeExecutionMap)) {
-    const cat = info.category;
-    behaviorSummary[cat] = (behaviorSummary[cat] || 0) + info.count;
-  }
-
-  // IP変化からCFG情報
-  const ipJumps = [];
-  for (let i = 1; i < vmTrace.length; i++) {
-    const d = vmTrace[i].ip - vmTrace[i-1].ip;
-    if (d !== 1 && d !== 0) ipJumps.push({ from: vmTrace[i-1].ip, to: vmTrace[i].ip, delta: d });
-  }
-
-  const opcodeIndex = { position: 1, confidence: 'high', note: 'inst[1]=opcode' };
-  const opcodeMap = { map: dispatchTable, opcodeIndex, opcodeExecutionMap };
-
-  return {
-    success: true,
-    totalInstructions: vmTrace.length,
-    uniqueOpcodes: sorted.length,
-    opcodeFrequency: sorted.slice(0, 20),
-    opcodeMap,
-    dispatchTable,
-    behaviorSummary,
-    ipJumps: ipJumps.slice(0, 30),
-    method: 'vm_trace_analyze',
-  };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #13/#14  staticCharDecoder / tableConcat 静的デコーダ
-// ────────────────────────────────────────────────────────────────────────
-function staticCharDecoder(code) {
-  let modified = code, found = false;
-  // #13: string.char(n, n, ...) の連続パターンを静的に文字列化
-  modified = modified.replace(/string\.char\(([^)]+)\)/g, (match, argsStr) => {
-    const args = argsStr.split(',').map(a => {
-      const n = parseInt(a.trim());
-      return isNaN(n) ? null : n;
-    });
-    if (args.some(a => a === null) || args.some(a => a < 0 || a > 255)) return match;
-    found = true;
-    const str = args.map(n => String.fromCharCode(n)).join('');
-    return `"${str.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r')}"`;
-  });
-
-  // #14: table.concat({string.char(...)}) パターン
-  modified = modified.replace(
-    /table\.concat\s*\(\s*\{([^}]+)\}\s*(?:,\s*"[^"]*"\s*)?\)/g,
-    (match, inner) => {
-      // inner の各要素が string.char(n,...) や "str" の場合に結合
-      const parts = inner.split(',').map(p => p.trim());
-      const strings = parts.map(p => {
-        const scm = p.match(/^string\.char\((\d+)\)$/);
-        if (scm) return String.fromCharCode(parseInt(scm[1]));
-        const strm = p.match(/^"((?:[^"\\]|\\.)*)"$|^'((?:[^'\\]|\\.)*)'$/);
-        if (strm) return strm[1] || strm[2];
-        return null;
-      });
-      if (strings.some(s => s === null)) return match;
-      found = true;
-      const result = strings.join('');
-      return `"${result.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`;
-    }
-  );
-
-  if (!found) return { success: false, error: 'string.char静的パターンなし', method: 'static_char' };
-  return { success: true, result: modified, method: 'static_char' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #15  xorDecoder 強化版 — bit32.bxor + ~ 演算子サポート
-// ────────────────────────────────────────────────────────────────────────
-function xorDecoder(code) {
-  let modified = code, found = false;
-
-  // bit32.bxor(a, b) — Lua 5.2
-  modified = modified.replace(/bit32\.bxor\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)/g, (_, a, b) => {
-    found = true; return String(parseInt(a) ^ parseInt(b));
-  });
-  // bit.bxor(a, b) — LuaJIT
-  modified = modified.replace(/bit\.bxor\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)/g, (_, a, b) => {
-    found = true; return String(parseInt(a) ^ parseInt(b));
-  });
-  // #15: ~ XOR演算子 (Lua5.3+) — string.char内のみ安全に展開
-  modified = modified.replace(/string\.char\((\d+)\s*~\s*(\d+)\)/g, (_, a, b) => {
-    found = true; return `string.char(${parseInt(a) ^ parseInt(b)})`;
-  });
-  // 255以下の ^ 演算 (XORとして扱う)
-  modified = modified.replace(/\b(\d+)\s*\^\s*(\d+)\b/g, (match, a, b) => {
-    const ia = parseInt(a), ib = parseInt(b);
-    if (ia <= 255 && ib <= 255) { found = true; return String(ia ^ ib); }
-    return match;
-  });
-
-  // XOR配列ブルートフォース
-  function xorByte(b, k) {
-    let r = 0;
-    for (let i = 0; i < 8; i++) {
-      if (((b >> i) & 1) !== ((k >> i) & 1)) r |= (1 << i);
-    }
-    return r;
-  }
-  const patterns = [/local\s+\w+\s*=\s*\{([0-9,\s]+)\}/g, /\{([0-9,\s]+)\}/g];
-  let encArrays = [];
-  for (const pat of patterns) {
-    let m; const p = new RegExp(pat.source, pat.flags);
-    while ((m = p.exec(code)) !== null) {
-      const nums = m[1].split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n));
-      if (nums.length > 3) encArrays.push(nums);
-    }
-    if (encArrays.length > 0) break;
-  }
-  if (encArrays.length > 0) {
-    let bestResult = null, bestScore = -1, bestKey = -1;
-    for (const arr of encArrays) {
-      for (let key = 0; key <= 255; key++) {
-        const str = arr.map(b => String.fromCharCode(xorByte(b, key))).join('');
-        const score = scoreLuaCode(str);
-        if (score > bestScore) { bestScore = score; bestResult = str; bestKey = key; }
-      }
-    }
-    if (bestScore > 10)
-      return { success: true, result: bestResult, key: bestKey, score: bestScore, method: 'xor_decoder' };
-  }
-
-  if (!found) return { success: false, error: 'XORパターンなし', method: 'xor_decoder' };
-  return { success: true, result: modified, method: 'xor_decoder' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #40-#53  vmDecompiler — VMログから疑似Luaコードを生成
-// ────────────────────────────────────────────────────────────────────────
-function vmDecompiler(vmTrace, bytecodeDump, opcodeMap) {
-  if (!vmTrace || vmTrace.length === 0)
-    return { success: false, error: 'vmTraceが空', pseudoCode: '', method: 'vm_decompile' };
-
-  const map       = (opcodeMap && opcodeMap.map) || {};
-  const exMap     = (opcodeMap && opcodeMap.opcodeExecutionMap) || {};
-  const catMap    = {};
-  for (const [name, info] of Object.entries(exMap)) catMap[info.opcode] = info.category;
-
-  // ── #49/#50: 定数テーブル抽出 ────────────────────────────────────────
-  const constTables = {};
-  for (const [tname, nums] of Object.entries(bytecodeDump || {})) {
-    constTables[tname] = nums;
-  }
-
-  // ── #41: 中間命令(IR)に変換 ─────────────────────────────────────────
-  const ir = [];
-  // map は dispatchTable(string key) か LUA51_OPCODES(number key) を自動選択
-  const resolvedMap = (map && Object.keys(map).length > 0) ? map : LUA51_OPCODES;
-  for (const entry of vmTrace) {
-    const { ip, op, arg1, arg2, arg3 } = entry;
-    const opName = (op !== null && op !== undefined)
-      ? (resolvedMap[String(op)] || resolvedMap[op] || `OP_${op}`) : 'UNKNOWN';
-    const cat    = catMap[String(op)] || catMap[op] || OPCODE_CATEGORIES[opName] || 'UNKNOWN';
-    ir.push({ ip, opName, cat, op, arg1, arg2, arg3 });
-  }
-
-  // ── #42: CFG構築 (IPベースの基本ブロック分割) ─────────────────────
-  // leaders: IPセットを ir[0].ipから始め、全IPを登録
-  const firstIp = ir.length > 0 ? ir[0].ip : 0;
-  const leaders   = new Set([firstIp]);
-  // 全IPをリーダー候補として追加
-  for (const inst of ir) leaders.add(inst.ip);
-  const jumpTargets = new Set();
-  for (const inst of ir) {
-    if (['JUMP','EQ','LT','LE','TEST','TESTSET'].includes(inst.cat)) {
-      // JMP offset から飛び先を計算
-      if (inst.opName === 'JMP' && inst.arg2 !== null) {
-        const target = inst.ip + 1 + inst.arg2;
-        leaders.add(target);
-        jumpTargets.add(target);
-      }
-      leaders.add(inst.ip + 1);
-    }
-    if (inst.cat === 'LOOP') {
-      leaders.add(inst.ip);
-      if (inst.arg2 !== null) leaders.add(inst.ip + 1 + inst.arg2);
-    }
-  }
-
-  // ── #43: 基本ブロック作成 ──────────────────────────────────────────
-  const blocks = [];
-  let currentBlock = null;
-  for (const inst of ir) {
-    if (leaders.has(inst.ip)) {
-      if (currentBlock) blocks.push(currentBlock);
-      currentBlock = { startIp: inst.ip, instructions: [], isLoopTarget: jumpTargets.has(inst.ip) };
-    }
-    if (currentBlock) currentBlock.instructions.push(inst);
-  }
-  if (currentBlock) blocks.push(currentBlock);
-
-  // ── #44-#48: 基本ブロックから疑似Luaコード生成 ──────────────────────
-  const lines = [];
-  lines.push('-- ══ YAJU VM Decompiled (疑似Lua) ══');
-  if (Object.keys(constTables).length > 0) {
-    // #50: 定数テーブルを local const = {...} として出力
-    for (const [tname, nums] of Object.entries(constTables)) {
-      lines.push(`local ${tname}_const = {${nums.slice(0,16).join(',')}${nums.length > 16 ? ',...' : ''}}`);
-    }
-    lines.push('');
-  }
-
-  // レジスタ名マッピング (#48)
-  const regName = (n) => n !== null ? `v${n}` : '_';
-
-  let indentLevel = 0;
-  const indent = () => '  '.repeat(indentLevel);
-  const prevIp = { val: -1 };
-
-  for (const block of blocks) {
-    if (block.isLoopTarget)
-      lines.push(`${indent()}::lbl_${block.startIp}::`);
-
-    for (const inst of block.instructions) {
-      const { ip, opName, cat, arg1, arg2, arg3 } = inst;
-      let line = '';
-
-      // #44: ジャンプ命令を if/while/for に復元
-      // #45: スタック操作を変数に復元
-      // #46: 算術opcode を + - * / に復元
-      // #47: CALL opcode を関数呼び出しに復元
-      // #48: VM register を Lua ローカル変数に変換
-      switch (opName) {
-        case 'MOVE':     line = `local ${regName(arg1)} = ${regName(arg2)}  -- MOVE`; break;
-        case 'LOADK':    line = `local ${regName(arg1)} = K[${arg2}]  -- LOADK`; break;
-        case 'LOADBOOL': line = `local ${regName(arg1)} = ${arg2 ? 'true' : 'false'}  -- LOADBOOL`; indentLevel=Math.max(0,indentLevel); break;
-        case 'LOADNIL':  line = `for __i=${arg1},(${arg2}) do local _v${arg1}=nil end  -- LOADNIL`; break;
-        case 'GETGLOBAL':line = `local ${regName(arg1)} = _G[K[${arg2}]]  -- GETGLOBAL`; break;
-        case 'SETGLOBAL':line = `_G[K[${arg2}]] = ${regName(arg1)}  -- SETGLOBAL`; break;
-        case 'GETTABLE': line = `local ${regName(arg1)} = ${regName(arg2)}[K_or_R(${arg3})]  -- GETTABLE`; break;
-        case 'SETTABLE': line = `${regName(arg1)}[K_or_R(${arg2})] = K_or_R(${arg3})  -- SETTABLE`; break;
-        case 'NEWTABLE': line = `local ${regName(arg1)} = {}  -- NEWTABLE`; break;
-        // #46: 算術
-        case 'ADD':    line = `local ${regName(arg1)} = ${regName(arg2)} + ${regName(arg3)}  -- ADD`; break;
-        case 'SUB':    line = `local ${regName(arg1)} = ${regName(arg2)} - ${regName(arg3)}  -- SUB`; break;
-        case 'MUL':    line = `local ${regName(arg1)} = ${regName(arg2)} * ${regName(arg3)}  -- MUL`; break;
-        case 'DIV':    line = `local ${regName(arg1)} = ${regName(arg2)} / ${regName(arg3)}  -- DIV`; break;
-        case 'MOD':    line = `local ${regName(arg1)} = ${regName(arg2)} % ${regName(arg3)}  -- MOD`; break;
-        case 'POW':    line = `local ${regName(arg1)} = ${regName(arg2)} ^ ${regName(arg3)}  -- POW`; break;
-        case 'UNM':    line = `local ${regName(arg1)} = -${regName(arg2)}  -- UNM`; break;
-        case 'NOT':    line = `local ${regName(arg1)} = not ${regName(arg2)}  -- NOT`; break;
-        case 'LEN':    line = `local ${regName(arg1)} = #${regName(arg2)}  -- LEN`; break;
-        case 'CONCAT': {
-          const parts = [];
-          for (let i = arg2; i <= arg3; i++) parts.push(regName(i));
-          line = `local ${regName(arg1)} = ${parts.join(' .. ')}  -- CONCAT`;
-          break;
-        }
-        // #44: ジャンプ命令
-        case 'JMP': {
-          const target = ip + 1 + (arg2 || 0);
-          line = `goto lbl_${target}  -- JMP target=${target}`;
-          break;
-        }
-        case 'EQ':  line = `if (${regName(arg2)} == ${regName(arg3)}) ~= ${arg1?'true':'false'} then goto lbl_${ip+2} end  -- EQ`; break;
-        case 'LT':  line = `if (${regName(arg2)} < ${regName(arg3)}) ~= ${arg1?'true':'false'} then goto lbl_${ip+2} end  -- LT`; break;
-        case 'LE':  line = `if (${regName(arg2)} <= ${regName(arg3)}) ~= ${arg1?'true':'false'} then goto lbl_${ip+2} end  -- LE`; break;
-        case 'TEST':    line = `if not ${regName(arg1)} then goto lbl_${ip+2} end  -- TEST`; break;
-        case 'TESTSET': line = `if ${regName(arg2)} then ${regName(arg1)}=${regName(arg2)} else goto lbl_${ip+2} end  -- TESTSET`; break;
-        // #47: CALL
-        case 'CALL': {
-          const nargs  = (arg2 || 1) - 1;
-          const nret   = (arg3 || 1) - 1;
-          const args_  = Array.from({length: nargs}, (_, i) => regName(arg1 + 1 + i));
-          const rets   = Array.from({length: Math.max(1, nret)}, (_, i) => regName(arg1 + i));
-          line = `${rets.join(', ')} = ${regName(arg1)}(${args_.join(', ')})  -- CALL`;
-          break;
-        }
-        case 'TAILCALL': {
-          const nargs_ = (arg2 || 1) - 1;
-          const args__ = Array.from({length: nargs_}, (_, i) => regName(arg1 + 1 + i));
-          line = `return ${regName(arg1)}(${args__.join(', ')})  -- TAILCALL`;
-          break;
-        }
-        case 'RETURN': {
-          if (!arg1 && !arg2) { line = 'return  -- RETURN'; break; }
-          const nvals = (arg2 || 1) - 1;
-          const vals  = Array.from({length: Math.max(1, nvals)}, (_, i) => regName((arg1||0) + i));
-          line = `return ${vals.join(', ')}  -- RETURN`;
-          break;
-        }
-        case 'FORPREP': line = `${regName(arg1)} = ${regName(arg1)} - ${regName(arg1+2)}  -- FORPREP`; indentLevel++; break;
-        case 'FORLOOP': line = `${regName(arg1)} = ${regName(arg1)} + ${regName(arg1+2)}; if ${regName(arg1)} <= ${regName(arg1+1)} then goto lbl_${ip+1+(arg2||0)} end  -- FORLOOP`; indentLevel=Math.max(0,indentLevel-1); break;
-        case 'CLOSURE': line = `local ${regName(arg1)} = function() --[[closure ${arg2}]] end  -- CLOSURE`; break;
-        case 'SETLIST': line = `-- SETLIST ${regName(arg1)}[...]  (#${arg3})`;  break;
-        case 'VARARG':  {
-          const nva = (arg2 || 1) - 1;
-          const vas = Array.from({length: Math.max(1,nva)}, (_, i) => regName((arg1||0)+i));
-          line = `${vas.join(', ')} = ...  -- VARARG`;
-          break;
-        }
-        default: line = `-- [ip=${ip}] ${opName}(${[arg1,arg2,arg3].filter(v=>v!==null).join(', ')})`;
-      }
-
-      lines.push(`${indent()}${line}`);
-      prevIp.val = ip;
-    }
-  }
-
-  lines.push('-- ══ End of Decompilation ══');
-  const pseudoCode = lines.join('\n');
-
-  // #53: decompiled.lua として保存
-  let savedPath = null;
-  try {
-    savedPath = path.join(tempDir, `decompiled_${Date.now()}.lua`);
-    fs.writeFileSync(savedPath, pseudoCode, 'utf8');
-  } catch {}
-
-  return {
-    success: true,
-    pseudoCode,
-    instructionCount: vmTrace.length,
-    blockCount: blocks.length,
-    savedPath,
-    method: 'vm_decompile',
-  };
-}
-
-// 後方互換: reconstructedLuaBuilder → vmDecompiler に委譲
-function reconstructedLuaBuilder(vmTrace, bytecodeDump, opcodeMap) {
-  return vmDecompiler(vmTrace, bytecodeDump, opcodeMap);
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #49/#50  bytecodeテーブル抽出
-// ────────────────────────────────────────────────────────────────────────
-function parseBytecodeDump(stdout) {
-  const bytecodeDump = {};
-  for (const line of stdout.split('\n')) {
-    const t = line.trim();
-    if (!t.startsWith('__BYTECODE__')) continue;
-    const parts = t.split('\t');
-    if (parts.length < 4) continue;
-    const tblName = parts[1], idx = parseInt(parts[2]), val = parseInt(parts[3]);
-    if (!bytecodeDump[tblName]) bytecodeDump[tblName] = [];
-    bytecodeDump[tblName][idx - 1] = val;
-  }
-  return bytecodeDump;
-}
-
-function vmBytecodeExtractor(code) {
-  const tables = [];
-  const tblPattern = /local\s+(\w+)\s*=\s*\{((?:\s*\d+\s*,){10,}[^}]*)\}/g;
+  const hints = [];
+  if (/return\s*\(function\s*\([^)]*\)/s.test(code)) hints.push('VMラッパー検出');
+  if (/\bInstructions\b|\bProto\b|\bupValues\b/i.test(code)) hints.push('Luaバイトコード構造を検出');
+  const strings = [];
+  const strPattern = /"([^"\\]{4,}(?:\\.[^"\\]*)*)"/g;
   let m;
-  while ((m = tblPattern.exec(code)) !== null) {
-    const name = m[1];
-    const nums = m[2].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-    if (nums.length >= 10) {
-      const max = Math.max(...nums);
-      tables.push({ name, count: nums.length, sample: nums.slice(0,16), isLikelyBytecode: max < 65536 });
-    }
-  }
-  if (tables.length === 0) return { success: false, error: 'バイトコードテーブルなし', method: 'vm_extract' };
-  return {
-    success: true, tables, method: 'vm_extract',
-    hints: tables.map(t=>`${t.name}[${t.count}]: [${t.sample.join(',')}...]${t.isLikelyBytecode?' (bytecode候補)':''}`),
-  };
+  while ((m = strPattern.exec(code)) !== null) { if (m[1].length > 4) strings.push(m[1]); }
+  if (strings.length > 0) hints.push(`${strings.length}件の文字列リテラルを抽出`);
+  if (/\{(\s*\d+\s*,){8,}/.test(code)) hints.push('大規模バイトコードテーブルを検出');
+  if (hints.length === 0) return { success: false, error: 'Vmifyパターンが検出されませんでした', method: 'vmify' };
+  return { success: true, result: code, hints, strings: strings.slice(0, 50), warning: 'Vmify完全解読には動的実行を推奨', method: 'vmify' };
 }
-
-const VM_TRACE_THRESHOLD = 50;
-function checkWereDevDetected(vmTrace) { return vmTrace.length >= VM_TRACE_THRESHOLD; }
-
-function dumpBytecodeTables(code) {
-  const candidates = [];
-  const tblPat = /local\s+(\w+)\s*=\s*\{([\s\d,]+)\}/g;
-  let m;
-  while ((m = tblPat.exec(code)) !== null) {
-    const nums = m[2].split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-    if (nums.length >= 50) candidates.push({ name: m[1], count: nums.length });
-  }
-  if (candidates.length === 0) return { code, injected: false, candidates: [] };
-  let inject = '\n-- ══ YAJU Bytecode Dump ══\n';
-  for (const c of candidates) {
-    inject += `if type(${c.name})=="table" then\n  for __i,__v in ipairs(${c.name}) do\n    print("__BYTECODE__\\t${c.name}\\t"..tostring(__i).."\\t"..tostring(__v))\n  end\nend\n`;
-  }
-  return { code: code + inject, injected: true, candidates };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #55  beautifyLua — 最終コード整形
-// ────────────────────────────────────────────────────────────────────────
-function beautifyLua(code) {
-  if (!code) return code;
-  let result = code;
-  // 連続した空行を2行以内に
-  result = result.replace(/\n{3,}/g, '\n\n');
-  // end/else/until の前に空行
-  result = result.replace(/([^\n])\n(end|else|elseif|until)\b/g, '$1\n\n$2');
-  // function の前に空行
-  result = result.replace(/([^\n])\n(local\s+function|function)\b/g, '$1\n\n$2');
-  // インデントの正規化 (タブ→2スペース)
-  result = result.replace(/\t/g, '  ');
-  // 末尾空白削除
-  result = result.replace(/[ \t]+$/gm, '');
-  return result.trim();
-}
-
-
-
-// ────────────────────────────────────────────────────────────────────────
-//  #16  stringTransformDecoder  — string.reverse/string.sub 型難読化復元
-// ────────────────────────────────────────────────────────────────────────
-function stringTransformDecoder(code) {
-  let modified=code, found=false;
-  const env=new SymbolicEnv();
-  // string.reverse("...") を直接評価
-  modified=modified.replace(/string\.reverse\s*\(\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\s*\)/g,(match,strExpr)=>{
-    const s=stripLuaString(strExpr); if(s===null) return match;
-    found=true;
-    const rev=s.split('').reverse().join('');
-    return `"${rev.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`;
-  });
-  // string.sub("...", i, j)
-  modified=modified.replace(/string\.sub\s*\(\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\s*,\s*(-?\d+)\s*(?:,\s*(-?\d+))?\s*\)/g,(match,strExpr,iStr,jStr)=>{
-    const s=stripLuaString(strExpr); if(s===null) return match;
-    let i=parseInt(iStr),j=jStr!==undefined?parseInt(jStr):s.length;
-    if(i<0) i=Math.max(0,s.length+i+1); if(j<0) j=s.length+j+1;
-    found=true;
-    const sub=s.slice(i-1,j);
-    return `"${sub.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`;
-  });
-  // string.rep("...", n)
-  modified=modified.replace(/string\.rep\s*\(\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\s*,\s*(\d+)\s*\)/g,(match,strExpr,nStr)=>{
-    const s=stripLuaString(strExpr); const n=parseInt(nStr);
-    if(s===null||isNaN(n)) return match;
-    found=true;
-    return `"${s.repeat(n).replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`;
-  });
-  if(!found) return { success:false, error:'stringTransformパターンが見つかりません', method:'str_transform' };
-  return { success:true, result:modified, method:'str_transform' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  #17  base64Detector  — Base64文字列を自動デコード
-// ────────────────────────────────────────────────────────────────────────
-function base64Detector(code, pool) {
-  const B64_RE=/[A-Za-z0-9+\/]{32,}={0,2}/g;
-  const found=[]; let m;
-  while((m=B64_RE.exec(code))!==null){
-    const b64=m[0];
-    try {
-      const decoded=Buffer.from(b64,'base64').toString('utf8');
-      // デコード結果がLuaコードっぽければプールに追加
-      if(scoreLuaCode(decoded)>20){
-        if(pool) pool.add(decoded,'base64_decode');
-        found.push({ b64:b64.substring(0,30)+'...', score:scoreLuaCode(decoded).toFixed(1), decoded:decoded.substring(0,60) });
-      }
-    } catch {}
-  }
-  if(found.length===0) return { success:false, error:'Base64Luaコードが見つかりません', method:'base64_detect' };
-  return { success:true, found, hints:found.map(f=>`score=${f.score}: "${f.decoded}..."`), method:'base64_detect' };
-}
-
-// ────────────────────────────────────────────────────────────────────────
-//  EncryptStrings  (後方互換 + charDecoder統合)
-// ────────────────────────────────────────────────────────────────────────
-function deobfuscateEncryptStrings(code) {
-  const env=new SymbolicEnv();
-  let res=charDecoder(code,env);
-  if(res.success) return res;
-  // フォールバック: 数値エスケープ展開
-  let modified=code, found=false;
-  modified=modified.replace(/"((?:\\[0-9]{1,3}|\\x[0-9a-fA-F]{2}|[^"\\])+)"/g,(match,inner)=>{
-    if(!/\\[0-9]|\\x/i.test(inner)) return match;
-    try {
-      const decoded=resolveLuaStringEscapes(inner);
-      if([...decoded].every(c=>c.charCodeAt(0)>=32&&c.charCodeAt(0)<=126)){
-        found=true; return `"${decoded.replace(/"/g,'\\"').replace(/\\/g,'\\\\')}"`;
-      }
-    } catch {}
-    return match;
-  });
-  if(!found) return { success:false, error:'EncryptStringsパターンが見つかりません', method:'encrypt_strings' };
-  return { success:true, result:modified, method:'encrypt_strings' };
-}
-
-// ════════════════════════════════════════════════════════════════════════
-//  #18 + #19  recursiveDeobfuscate  — 再帰的解析 + seenCodeCache
-// ════════════════════════════════════════════════════════════════════════
-function recursiveDeobfuscate(code, maxDepth, pool) {
-  maxDepth=maxDepth||8;
-  pool=pool||new CapturePool();
-  const seenHashes=new Set();
-
-  // 静的パスのリスト（処理順: #1の要件に対応）
-  const staticPasses=[
-    { name:'ConstantFolding',    fn: c=>evaluateExpressions(c) },
-    { name:'EvalExpressions',    fn: c=>evaluateExpressions(c) },
-    { name:'SplitStrings',       fn: c=>deobfuscateSplitStrings(c) },
-    { name:'XOR',                fn: c=>xorDecoder(c) },
-    { name:'ConstantArray',      fn: c=>constantArrayResolver(c) },
-    { name:'CharDecoder',        fn: c=>charDecoder(c) },
-    { name:'MathEval',           fn: c=>mathEvaluator(c) },
-    { name:'ConstantCall',       fn: c=>constantCallEvaluator(c) },
-    { name:'StringTransform',    fn: c=>stringTransformDecoder(c) },
-    { name:'DeadBranch',         fn: c=>deadBranchRemover(c) },
-    { name:'JunkClean',          fn: c=>junkAssignmentCleaner(c) },
-  ];
-
-  let current=code;
-  let depth=0;
-  const allSteps=[];
-
-  while(depth++<maxDepth){
-    const h=cacheHash(current);
-    if(seenHashes.has(h)) break;
-    seenHashes.add(h);
-
-    // キャッシュチェック
-    const cached=cacheGet(current);
-    if(cached){ current=cached; allSteps.push({step:'CacheHit',success:true,method:'cache'}); break; }
-
-    let anyChange=false;
-    for(const pass of staticPasses){
-      const res=pass.fn(current);
-      if(res.success&&res.result&&res.result!==current){
-        allSteps.push({ step:pass.name, success:true, method:res.method });
-        pool.add(res.result, pass.name);
-        current=res.result;
-        anyChange=true;
-      }
-    }
-
-    // base64チェック
-    base64Detector(current, pool);
-
-    if(!anyChange) break;
-  }
-
-  // キャッシュに保存
-  if(current!==code) cacheSet(code, current);
-
-  return { code:current, steps:allSteps, pool };
-}
-
-// ════════════════════════════════════════════════════════════════════════
-//  advancedStaticDeobfuscate  — 全パス統合エントリーポイント
-// ════════════════════════════════════════════════════════════════════════
-function advancedStaticDeobfuscate(code) {
-  const pool=new CapturePool();
-  const { code:result, steps } = recursiveDeobfuscate(code, 8, pool);
-  const changed=result!==code;
-  return {
-    success: changed,
-    result,
-    steps: steps.map(s=>s.step),
-    method: 'advanced_static',
-    error: changed?undefined:'静的解析で変化なし（動的実行が必要な可能性があります）',
-  };
-}
-
-// deepStaticDeobfuscate (後方互換)
-function deepStaticDeobfuscate(code, maxDepth) {
-  const { code:result, steps } = recursiveDeobfuscate(code, maxDepth||6, new CapturePool());
-  return { code:result, changed:result!==code };
-}
-
-// symbolicExecute, SymbolicEnv (後方互換エクスポート用スタブ)
-function symbolicExecute(code, env, depth, visited) {
-  const res=recursiveDeobfuscate(code, 2, new CapturePool());
-  return { code:res.code, env:env||new SymbolicEnv(), changed:res.code!==code };
-}
-
-
-
-
 
 // ════════════════════════════════════════════════════════
-//  AUTO  — v3 解析パイプライン
+//  AUTO  —  動的実行メイン、静的解析はフォールバック
 //
-//  処理順 (#1要件):
-//   1. advanced_static (ConstantFolding / SymExec / 全静的パス)
-//   2. evaluate_expressions
-//   3. split_strings
-//   4. xor
-//   5. constant_array
-//   6. dynamic (Lua実行 → 多段ループ)
-//   7. vmify (VM検出ヒント)
+//  フロー:
+//   ① まず動的実行を試みる（Renderサーバーのluaを使う）
+//   ② 成功した場合、結果をさらに動的実行（多段難読化対応）
+//   ③ 動的実行が失敗した場合のみ静的解析を試みる
+//   ④ 静的解析で変化があれば、もう一度動的実行を試みる
 // ════════════════════════════════════════════════════════
-// ════════════════════════════════════════════════════════════════════════
-//  autoDeobfuscate  v4  — 全10項目対応パイプライン
-//
-//  処理順:
-//   ① dynamicDecode (loadstring hook, safeEnv, __DECODED__ dump) ← #1/#2 最初に配置
-//   ② loaderPatternDetected チェック → true なら VM解析スキップ   ← #7/#8
-//   ③ 静的解析群 (advanced_static, eval, split, xor, constantArray)
-//   ④ VM検出 → dynamicDecode結果に対してのみ実行                  ← #1/#5
-//   ⑤ VM解析 (vmTraceAnalyzer, reconstructedLuaBuilder)
-//   ⑥ #10: decode結果がLuaコードなら再帰パイプライン実行
-// ════════════════════════════════════════════════════════════════════════
-
-// ════════════════════════════════════════════════════════════════════════
-//  BLOCK 4: dynamicDecode v2 + autoDeobfuscate v5 (#1-#57 統合)
-// ════════════════════════════════════════════════════════════════════════
-
-// ────────────────────────────────────────────────────────────────────────
-//  dynamicDecode v2  (#2/#4-#11/#23-#25)
-// ────────────────────────────────────────────────────────────────────────
-async function dynamicDecode(code) {
-  const luaBin = checkLuaAvailable();
-  if (!luaBin) return { success: false, error: 'Luaがインストールされていません', method: 'dynamic_decode' };
-
-  const filtered = sandboxFilter(code);
-  if (!filtered.safe) return { success: false, error: filtered.reason, method: 'dynamic_decode' };
-  if (filtered.removed.length > 0) console.log('[DynDec] 危険関数除去:', filtered.removed.join(', '));
-
-  // preamble: safeEnv + hookLoadstring + vmHookBootstrap
-  const preamble = safeEnvPreamble + '\n' + hookLoadstringCode + '\n' + vmHookBootstrap;
-
-  // #23: vmDetector(codeToRun) — hook注入後のコードに対して検出
-  let codeToRun = filtered.code;
-  let vmHookInjected = false, bytecodeCandidates = [];
-
-  const vmInfoPre = vmDetector(codeToRun);  // hook前の初期検出
-
-  // VM検出後に hook注入
-  if (vmInfoPre.isVm || vmInfoPre.isWereDev || vmInfoPre.isMoonSec || vmInfoPre.isLuraph) {
-    // #24: /while\s+true\s+do|repeat\s+until/ に拡張
-    const hasVmLoop = /while\s+true\s+do|repeat\s+until/.test(codeToRun);
-    if (hasVmLoop) {
-      const hookResult = injectVmHook(codeToRun, vmInfoPre);
-      codeToRun = hookResult.code;
-      vmHookInjected = hookResult.injected;
-    }
-    const dumpResult = dumpBytecodeTables(codeToRun);
-    codeToRun = dumpResult.code;
-    bytecodeCandidates = dumpResult.candidates;
-  }
-
-  // #23: hook注入後のコードで再検出
-  const vmInfo = vmDetector(codeToRun);
-
-  const fullCode = preamble + '\n' + codeToRun + '\n' + vmDumpFooter;
-  const safeFullCode = fullCode.replace(/\]\]/g, '] ]');
-  const tempFile = path.join(tempDir, `dyndec_${Date.now()}_${Math.random().toString(36).substring(7)}.lua`);
-
-  const wrapper = `
--- ══ YAJU dynamicDecode v2 Wrapper ══
--- アンチダンプ・アンチデバッグを無効化
-pcall(function()
-  if debug then
-    debug.sethook=function() end; debug.getinfo=nil
-    debug.getlocal=nil; debug.setlocal=nil
-    debug.getupvalue=nil; debug.setupvalue=nil
-  end
-end)
-pcall(function()
-  if getfenv then
-    local env=getfenv()
-    env.saveinstance=nil; env.dumpstring=nil; env.save_instance=nil
-  end
-end)
-
-local __obf_code = [[
-${safeFullCode}
-]]
-
-local __orig_ls_outer = loadstring or load
-local __ok, __err = pcall(function()
-  local chunk, err = __orig_ls_outer(__obf_code)
-  if not chunk then error("parse error: " .. tostring(err)) end
-  chunk()
-end)
-
-if not __ok then
-  io.write("\\n__EXEC_ERROR__:" .. tostring(__err) .. "\\n")
-end
-`;
-
-  return new Promise(resolve => {
-    fs.writeFileSync(tempFile, wrapper, 'utf8');
-
-    // #25: タイムアウトを 6000ms に変更 (3000→6000)
-    exec(`${luaBin} ${tempFile}`, { timeout: 6000, maxBuffer: 5 * 1024 * 1024 }, (error, stdout, stderr) => {
-      try { fs.unlinkSync(tempFile); } catch {}
-
-      // #9: __DECODED__ 抽出 (scoreLuaCode フィルター付き #10)
-      const decoded = parseDecodedOutputs(stdout);
-
-      // VMログ抽出 (#34/#35)
-      const vmTrace      = parseVmLogs(stdout);
-      const bytecodeDump = parseBytecodeDump(stdout);
-      const wereDevDetected = checkWereDevDetected(vmTrace);
-
-      // #36: vmトレースをJSONで保存
-      if (vmTrace.length > 0) saveVmTrace(vmTrace, Date.now());
-
-      const vmAnalysis = { vmTrace, bytecodeDump, wereDevDetected, vmHookInjected, bytecodeCandidates, vmInfo };
-      if (wereDevDetected) {
-        vmAnalysis.traceAnalysis  = vmTraceAnalyzer(vmTrace);    // #37/#38/#39
-        vmAnalysis.reconstruction = vmDecompiler(               // #40-#52
-          vmTrace, bytecodeDump, vmAnalysis.traceAnalysis.opcodeMap
-        );
-      }
-
-      // __DECODED__ が取れた場合
-      if (decoded.best) {
-        return resolve({
-          success: true,
-          result: decoded.best,
-          allDecoded: decoded.all.map(d => d.code),
-          decodedCount: decoded.all.length,
-          method: 'dynamic_decode',
-          vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined,
-        });
-      }
-
-      // VMトレース再構築が取れた場合
-      if (wereDevDetected && vmAnalysis.reconstruction && vmAnalysis.reconstruction.success) {
-        return resolve({
-          success: true,
-          result: vmAnalysis.reconstruction.pseudoCode,
-          method: 'dynamic_decode_vm',
-          vmAnalysis,
-          WereDevVMDetected: true,
-        });
-      }
-
-      const errMsg = stdout.includes('__EXEC_ERROR__:')
-        ? stdout.split('__EXEC_ERROR__:')[1]?.substring(0, 300) || ''
-        : (stderr || '').substring(0, 300);
-
-      resolve({
-        success: false,
-        error: errMsg || 'loadstringが呼ばれませんでした',
-        method: 'dynamic_decode',
-        vmAnalysis: vmTrace.length > 0 ? vmAnalysis : undefined,
-      });
-    });
-  });
-}
-
-async function tryDynamicExecution(code) { return dynamicDecode(code); }
-
-// ────────────────────────────────────────────────────────────────────────
-//  autoDeobfuscate v5  (#1-#20, #56/#57 最終処理)
-// ────────────────────────────────────────────────────────────────────────
-async function autoDeobfuscate(code, _depth) {
-  const depth   = _depth || 0;
+async function autoDeobfuscate(code) {
   const results = [];
-  const origCode = code;  // #17: 元コード保持用
-  let current   = code;
-  const luaBin  = checkLuaAvailable();
-  const pool    = new CapturePool();
-  pool.add(current, 'input');
+  let current = code;
+  const luaBin = checkLuaAvailable();
 
-  // ══ #1: stripComments ════════════════════════════════════════════════
-  {
-    const stripped = stripComments(current);
-    if (stripped !== current) {
-      results.push({ step: 'StripComments', success: true, method: 'strip_comments',
-        hints: ['巨大コメント難読化を除去'] });
-      current = stripped;
-      pool.add(current, 'strip_comments');
-    }
-  }
-
-  // ══ #2/#3: loaderPatternDetected → dynamicDecode 最優先 ═════════════
-  const isLoaderPattern = loaderPatternDetected(current);
-  results.push({
-    step: 'LoaderPatternCheck', success: true, method: 'loader_pattern',
-    loaderPattern: isLoaderPattern,
-    hints: isLoaderPattern ? ['loaderパターン検出 → dynamicDecode優先'] : [],
-  });
-
-  let dynDecodedResult = null, dynVmAnalysis = null, wereDevDetected = false;
-
+  // ① メイン: 動的実行
   if (luaBin) {
-    // ── #2: dynamicDecode を pipeline 最初に ──
-    const dynRes = await dynamicDecode(current);
-    results.push({
-      step: `dynamicDecode${depth > 0 ? ` (再帰${depth})` : ''}`,
-      success: dynRes.success, result: dynRes.result,
-      method: dynRes.method, error: dynRes.error,
-      decodedCount: dynRes.decodedCount,
-      WereDevVMDetected: dynRes.WereDevVMDetected,
-    });
+    const dynRes = await tryDynamicExecution(current);
+    results.push({ step: '動的実行 (1回目)', ...dynRes });
 
     if (dynRes.success && dynRes.result) {
-      dynDecodedResult = dynRes.result;
-      dynVmAnalysis    = dynRes.vmAnalysis || null;
-      wereDevDetected  = !!(dynRes.WereDevVMDetected || (dynVmAnalysis && dynVmAnalysis.wereDevDetected));
-      current          = dynRes.result;
-      pool.add(current, 'dynamic_decode');
+      current = dynRes.result;
 
-      // #18: decoded.all を CapturePool に追加
-      if (dynRes.allDecoded) {
-        for (const dc of dynRes.allDecoded) pool.add(dc, 'decoded_candidate');
+      // ② 多段難読化対応: 結果をさらに動的実行（最大3回）
+      for (let round = 2; round <= 4; round++) {
+        // 結果がまだ難読化されていそうか確認（loadstringやBase64の特徴があるか）
+        const stillObfuscated = /loadstring|load\s*\(|[A-Za-z0-9+/]{60,}={0,2}/.test(current);
+        if (!stillObfuscated) break;
+
+        const dynRes2 = await tryDynamicExecution(current);
+        results.push({ step: `動的実行 (${round}回目)`, ...dynRes2 });
+        if (dynRes2.success && dynRes2.result && dynRes2.result !== current) {
+          current = dynRes2.result;
+        } else {
+          break; // これ以上変化しないので停止
+        }
+      }
+    } else {
+      // ③ 動的実行が失敗 → 静的解析で前処理してから再挑戦
+      results.push({ step: '静的解析フォールバック開始', success: true, result: current, method: 'info' });
+
+      const staticSteps = [
+        { name: 'SplitStrings',    fn: deobfuscateSplitStrings },
+        { name: 'EncryptStrings',  fn: deobfuscateEncryptStrings },
+        { name: 'EvalExpressions', fn: evaluateExpressions },
+        { name: 'ConstantArray',   fn: deobfuscateConstantArray },
+        { name: 'XOR',             fn: deobfuscateXOR },
+      ];
+
+      let staticChanged = false;
+      for (const step of staticSteps) {
+        const res = step.fn(current);
+        results.push({ step: step.name, ...res });
+        if (res.success && res.result && res.result !== current) {
+          current = res.result;
+          staticChanged = true;
+        }
       }
 
-      // #11: decoded.best がある場合 → 再帰実行で多段loaderを解読
-      if (depth < 3) {
-        const recurseCheck = /loadstring|load\s*\(|table\.concat\s*\(/.test(current);
-        if (recurseCheck) {
-          const recurse = await autoDeobfuscate(current, depth + 1);
-          if (recurse.finalCode && recurse.finalCode !== current) {
-            current = recurse.finalCode;
-            pool.add(current, `recursive_loader_${depth + 1}`);
-            results.push({
-              step: `RecursiveLoader (depth=${depth+1})`, success: true, method: 'recursive_loader',
-              hints: [`多段loader再帰 depth=${depth+1}: ${recurse.steps.length}ステップ`],
-            });
-          }
-        }
+      // ④ 静的解析で変化があれば動的実行を再試行
+      if (staticChanged) {
+        const dynRes3 = await tryDynamicExecution(current);
+        results.push({ step: '動的実行 (静的解析後)', ...dynRes3 });
+        if (dynRes3.success && dynRes3.result) current = dynRes3.result;
       }
     }
   } else {
-    results.push({ step: 'dynamicDecode', success: false,
-      error: 'Luaがインストールされていません', method: 'dynamic_decode' });
-  }
-
-  // ══ #12: pipeline 順序 ══════════════════════════════════════════════
-  //  junk_clean → eval_expressions → char_decoder → xor_decoder
-  //  → constant_array → str_transform → dead_branch
-  // ══════════════════════════════════════════════════════════════════════
-  const staticPipeline = [
-    ['JunkClean',         junkAssignmentCleaner],
-    ['EvalExpressions',   evaluateExpressions],
-    ['CharDecoder',       (c) => staticCharDecoder(c)],   // #13/#14 強化版
-    ['XorDecoder',        xorDecoder],
-    ['ConstantArray',     constantArrayResolver],
-    ['StringTransform',   stringTransformDecoder],
-    ['DeadBranch',        deadBranchRemover],
-  ];
-
-  // #16: maxPasses を 10 に増加
-  const MAX_PASSES = 10;
-  let passChanged = true;
-  for (let pass = 0; pass < MAX_PASSES && passChanged; pass++) {
-    passChanged = false;
-    for (const [name, fn] of staticPipeline) {
-      const res = fn(current);
-      if (res.success && res.result && res.result !== current) {
-        results.push({ step: `${name} (pass${pass+1})`, ...res });
-        current = res.result;
-        pool.add(current, name.toLowerCase());
-        passChanged = true;
-      }
+    // Luaなし → 静的解析のみ
+    results.push({ step: '動的実行', success: false, error: 'Luaがインストールされていません', method: 'dynamic' });
+    const staticSteps = [
+      { name: 'SplitStrings',    fn: deobfuscateSplitStrings },
+      { name: 'EncryptStrings',  fn: deobfuscateEncryptStrings },
+      { name: 'EvalExpressions', fn: evaluateExpressions },
+      { name: 'ConstantArray',   fn: deobfuscateConstantArray },
+      { name: 'XOR',             fn: deobfuscateXOR },
+      { name: 'Vmify',           fn: deobfuscateVmify },
+    ];
+    for (const step of staticSteps) {
+      const res = step.fn(current);
+      results.push({ step: step.name, ...res });
+      if (res.success && res.result && res.result !== current) current = res.result;
     }
   }
 
-  // AdvancedStatic (SymExec + ConstantFolding)
-  {
-    const advRes = advancedStaticDeobfuscate(current);
-    if (advRes.success && advRes.result !== current) {
-      results.push({ step: 'AdvancedStatic', ...advRes });
-      current = advRes.result;
-      pool.add(current, 'advanced_static');
-    }
-  }
-
-  // 静的後 dynamicDecode 再試行
-  if (luaBin && current !== origCode && !dynDecodedResult) {
-    const dynRes2 = await dynamicDecode(current);
-    results.push({ step: 'dynamicDecode (post-static)', ...dynRes2 });
-    if (dynRes2.success && dynRes2.result) {
-      current = dynRes2.result;
-      pool.add(current, 'dynamic_post_static');
-      if (dynRes2.allDecoded) {
-        for (const dc of dynRes2.allDecoded) pool.add(dc, 'decoded_candidate2');
-      }
-    }
-  }
-
-  // ══ #19: VM検出は dynamicDecode の後にのみ ═══════════════════════════
-  if (!isLoaderPattern) {
-    const vmTarget = dynDecodedResult || current;
-    const vmRes    = deobfuscateVmify(vmTarget);
-
-    if (vmRes.success) {
-      results.push({ step: 'VmDetect', ...vmRes });
-      const vmEx = vmBytecodeExtractor(vmTarget);
-      if (vmEx.success) results.push({ step: 'VmBytecodeExtract', ...vmEx });
-
-      const vmAnalysis = dynVmAnalysis ||
-        results.map(r => r.vmAnalysis).find(a => a && a.vmTrace && a.vmTrace.length > 0);
-
-      if (vmAnalysis && vmAnalysis.vmTrace && vmAnalysis.vmTrace.length > 0) {
-        const { vmTrace, bytecodeDump } = vmAnalysis;
-        const traceResult = vmTraceAnalyzer(vmTrace);            // #37-#39
-        results.push({ step: 'VmTraceAnalyzer', ...traceResult });
-
-        // #54: vmDecompiler を実行して VMコードを Lua に戻す
-        const decompResult = vmDecompiler(vmTrace, bytecodeDump, traceResult.opcodeMap);  // #40-#53
-        results.push({ step: 'VmDecompiler', ...decompResult });
-        if (decompResult.success && decompResult.pseudoCode) {
-          current = decompResult.pseudoCode;
-          pool.add(current, 'vm_decompiled');
-        }
-      }
-    }
-  } else {
-    results.push({ step: 'VmDetect (skipped)', success: false,
-      method: 'vm_detect_skipped', error: 'loaderPattern: VM解析スキップ' });
-  }
-
-  // base64検出
-  {
-    const b64res = base64Detector(current, pool);
-    if (b64res.success) results.push({ step: 'Base64Detect', ...b64res });
-  }
-
-  // ══ #55: beautifyLua で整形 ══════════════════════════════════════════
-  const beautified = beautifyLua(current);
-  if (beautified !== current) {
-    current = beautified;
-    results.push({ step: 'BeautifyLua', success: true, method: 'beautify' });
-  }
-
-  // ══ #56: スコア再計算 — 元コードより低ければ元コードを保持 ═══════════
-  // #17
-  const origScore = scoreLuaCode(origCode);
-  const finalScore = scoreLuaCode(current);
-  if (finalScore < origScore && current !== origCode) {
-    const poolBest = pool.getBest();
-    if (poolBest && scoreLuaCode(poolBest) >= origScore) {
-      current = poolBest;
-      results.push({ step: 'ScoreFallback', success: true, method: 'score_fallback',
-        hints: [`スコア改善: CapturePool最善候補を使用 (${finalScore.toFixed(0)} < ${origScore.toFixed(0)})`] });
-    }
-  }
-  const bestFinal = pool.getBest() || current;
-  const bestScore = Math.max(scoreLuaCode(current), scoreLuaCode(bestFinal));
-  if (scoreLuaCode(bestFinal) > scoreLuaCode(current)) current = bestFinal;
-
-  // ══ #57: result.lua として保存 ═══════════════════════════════════════
-  let savedResultPath = null;
-  try {
-    savedResultPath = path.join(tempDir, `result_${Date.now()}.lua`);
-    fs.writeFileSync(savedResultPath, current, 'utf8');
-  } catch {}
-
-  return {
-    success: results.some(r => r.success && r.result),
-    steps: results,
-    finalCode: current,
-    finalScore: scoreLuaCode(current),
-    poolSize: pool.entries.length,
-    savedResultPath,
-    depth,
-  };
+  return { success: results.some(r => r.success), steps: results, finalCode: current };
 }
-
-
 
 // ════════════════════════════════════════════════════════
 //  Prometheus 難読化
