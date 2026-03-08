@@ -2140,7 +2140,129 @@ end
   });
 }
 
-async function tryDynamicExecution(code) { return dynamicDecode(code); }
+async function tryDynamicExecution(code) {
+  const luaBin = checkLuaAvailable();
+  if (!luaBin) return { success: false, error: 'Luaがインストールされていません', method: 'dynamic' };
+
+  const tempFile = path.join(tempDir, `obf_${Date.now()}_${Math.random().toString(36).substring(7)}.lua`);
+
+  // ]] が含まれる場合のエスケープ
+  const safeCode = code.replace(/\]\]/g, '] ]');
+
+  const wrapper = `
+-- ══════════════════════════════════════════
+--  YAJU Deobfuscator - Dynamic Execution Wrapper
+-- ══════════════════════════════════════════
+
+-- 全キャプチャを格納するテーブル（多段対応）
+local __captures = {}
+local __capture_count = 0
+local __original_loadstring = loadstring or load
+local __original_load = load or loadstring
+
+-- アンチダンプ・アンチデバッグを無効化
+pcall(function()
+  if debug then
+    debug.sethook = function() end
+    debug.getinfo = nil
+    debug.getlocal = nil
+    debug.setlocal = nil
+    debug.getupvalue = nil
+    debug.setupvalue = nil
+  end
+end)
+pcall(function()
+  if getfenv then
+    local env = getfenv()
+    env.saveinstance = nil
+    env.dumpstring = nil
+    env.save_instance = nil
+  end
+end)
+
+-- loadstring / load を完全フック
+local function __hook(code_str, ...)
+  if type(code_str) == "string" and #code_str > 20 then
+    __capture_count = __capture_count + 1
+    __captures[__capture_count] = code_str
+  end
+  return __original_loadstring(code_str, ...)
+end
+
+_G.loadstring = __hook
+_G.load       = __hook
+if rawset then
+  pcall(function() rawset(_G, "loadstring", __hook) end)
+  pcall(function() rawset(_G, "load", __hook) end)
+end
+
+-- 難読化コードを実行
+local __obf_code = [[
+${safeCode}
+]]
+
+local __ok, __err = pcall(function()
+  local chunk, err = __original_loadstring(__obf_code)
+  if not chunk then error("parse error: " .. tostring(err)) end
+  chunk()
+end)
+
+-- キャプチャ結果を出力（最後にキャプチャされたものが最も解読されたもの）
+if __capture_count > 0 then
+  -- 最も長い（＝最も展開された）コードを選択
+  local best = __captures[1]
+  for i = 2, __capture_count do
+    if #__captures[i] > #best then best = __captures[i] end
+  end
+  io.write("__CAPTURED_START__")
+  io.write(best)
+  io.write("__CAPTURED_END__")
+  -- 多段情報も出力
+  if __capture_count > 1 then
+    io.write("__LAYERS__:" .. tostring(__capture_count))
+  end
+else
+  io.write("__NO_CAPTURE__")
+  if not __ok then
+    io.write("__ERROR__:" .. tostring(__err))
+  end
+end
+`;
+
+  return new Promise(resolve => {
+    fs.writeFileSync(tempFile, wrapper, 'utf8');
+
+    exec(`${luaBin} ${tempFile}`, { timeout: 20000, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+      try { fs.unlinkSync(tempFile); } catch {}
+
+      // キャプチャ成功
+      if (stdout.includes('__CAPTURED_START__') && stdout.includes('__CAPTURED_END__')) {
+        const start    = stdout.indexOf('__CAPTURED_START__') + '__CAPTURED_START__'.length;
+        const end      = stdout.indexOf('__CAPTURED_END__');
+        const captured = stdout.substring(start, end).trim();
+
+        if (captured && captured.length > 5) {
+          // 多段レイヤー数を取得
+          const layerMatch = stdout.match(/__LAYERS__:(\d+)/);
+          const layers = layerMatch ? parseInt(layerMatch[1]) : 1;
+          return resolve({ success: true, result: captured, layers, method: 'dynamic' });
+        }
+      }
+
+      // エラー情報
+      if (stdout.includes('__ERROR__:')) {
+        const errMsg = stdout.split('__ERROR__:')[1] || '';
+        return resolve({ success: false, error: 'Luaエラー: ' + errMsg.substring(0, 300), method: 'dynamic' });
+      }
+
+      if (error && stderr) {
+        return resolve({ success: false, error: '実行エラー: ' + stderr.substring(0, 300), method: 'dynamic' });
+      }
+
+      resolve({ success: false, error: 'loadstring()が呼ばれませんでした（VM系難読化の可能性）', method: 'dynamic' });
+    });
+  });
+}
 
 // ────────────────────────────────────────────────────────────────────────
 //  autoDeobfuscate v5  (#1-#20, #56/#57 最終処理)
