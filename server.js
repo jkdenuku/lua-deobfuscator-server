@@ -1187,40 +1187,73 @@ function deobfuscateVmify(code) {
 //  #26/#27/#28/#29  vmHookBootstrap 強化版
 // ────────────────────────────────────────────────────────────────────────
 const vmHookBootstrap = `
--- ══ YAJU VM Hook Bootstrap v4 ══
+-- ══ YAJU VM Hook Bootstrap v6 (Weredev専用) ══
+-- Weredev VM変数規約:
+--   B   = bytecodeテーブル (instructions配列)
+--   V   = レジスタテーブル  (0-indexed)
+--   pc  = program counter
+--   l   = 現在のopcode (local l = B[pc])
+--   m   = string accessor関数 (定数プール lookup)
 
--- ── 旧 __vmhook 互換テーブル ──────────────────────────────────────────
+-- ── 共通カウンタ・テーブル ────────────────────────────────────────────
 __vm_logs      = {}
 __vm_log_count = 0
 __vm_max_logs  = 5000
 
--- ── [2] __vmtrace: instruction trace テーブル ────────────────────────
+-- [1] trace テーブル: {i, pc, l, A, B, C, regs}
 __vmtrace       = {}
 __vmtrace_count = 0
-__vmtrace_max   = 10000   -- 最大 10000 命令
+__vmtrace_max   = 10000
 
--- ── [2] __vmtrace_hook: opcode/a/b/c を trace に蓄積 ─────────────────
--- 呼び出し規約: __vmtrace_hook(ip, opcode, a, b, c)
-function __vmtrace_hook(ip, opcode, a, b, c)
+-- [3] m() ストリングログ: {i, idx, val}
+__strlog       = {}
+__strlog_count = 0
+__strlog_max   = 2000
+
+-- [2] B/V プリダンプ用テーブル
+__bdump        = nil   -- B テーブルのスナップショット
+__vdump        = nil   -- V テーブルのスナップショット
+
+-- ── [1] __vmtrace_hook: while dispatch ループ内から呼ぶ ──────────────
+-- injectVmHook が "local l = B[pc]" の直後に以下を注入する:
+--   __vmtrace_hook(pc, l, l and l[2], l and l[3], l and l[4])
+-- またはスカラーopcode形式の場合:
+--   __vmtrace_hook(pc, l, nil, nil, nil)
+function __vmtrace_hook(pc, l, A, B_op, C)
   if __vmtrace_count >= __vmtrace_max then return end
   __vmtrace_count = __vmtrace_count + 1
+  -- レジスタスナップショット V[0..7]
+  local regs = {}
+  if type(V) == "table" then
+    for ri = 0, 7 do
+      local rv = rawget(V, ri)
+      if rv ~= nil then
+        if type(rv) == "number" then regs[ri] = rv
+        elseif type(rv) == "string" then regs[ri] = rv:sub(1, 40)
+        elseif type(rv) == "boolean" then regs[ri] = rv
+        else regs[ri] = type(rv) end
+      end
+    end
+  end
+  -- trace[#trace+1] = {opcode=l, A, B, C, regs}
   __vmtrace[__vmtrace_count] = {
-    i  = __vmtrace_count,
-    ip = ip  or 0,
-    op = opcode,
-    a  = a,
-    b  = b,
-    c  = c,
+    i    = __vmtrace_count,
+    pc   = pc   or 0,
+    l    = l,
+    A    = A,
+    B    = B_op,
+    C    = C,
+    regs = regs,
   }
 end
 
--- ── 旧 __vmhook (互換) ────────────────────────────────────────────────
+-- ── 旧 __vmhook (互換維持) ────────────────────────────────────────────
 function __vmhook(ip, inst, stack, reg)
   if __vm_log_count >= __vm_max_logs then return end
   __vm_log_count = __vm_log_count + 1
   local entry = { ip = ip, ts = __vm_log_count }
   if type(inst) == "table" then
-    entry.op   = inst[1]; entry.arg1 = inst[2]
+    entry.op = inst[1]; entry.arg1 = inst[2]
     entry.arg2 = inst[3]; entry.arg3 = inst[4]
     __vmtrace_hook(ip, inst[1], inst[2], inst[3], inst[4])
   elseif type(inst) == "number" then
@@ -1230,68 +1263,60 @@ function __vmhook(ip, inst, stack, reg)
   table.insert(__vm_logs, entry)
 end
 
--- ── [2] while dispatch ループ自己検出フック ───────────────────────────
--- WeredevのVMは通常:
---   local inst = bytecode[ip]  → opcode=inst[1], A=inst[2], B=inst[3], C=inst[4]
--- または:
---   local opcode = inst[1]     → dispatch[opcode](...)
--- の形を取る。
--- debug.sethook で "line" イベントをトリガーして変数を覗く方法は
--- Lua5.1では使えないため、代わりに __index メタメソッドで
--- bytecode テーブルへのアクセスをインターセプトする。
---
--- アプローチ: グローバルに存在しうる bytecode / instructions / proto
--- テーブルに __index フックを仕込み、アクセスのたびに trace する。
--- ──────────────────────────────────────────────────────────────────────
-local function __install_vm_intercept()
-  -- 候補テーブル名（WereDev / MoonSec / Luraph で使われる変数名）
-  local candidates = {
-    "bytecode","instructions","Bytecode","Instructions",
-    "proto","Proto","code","Code","ops","Ops",
-  }
-  for _, name in ipairs(candidates) do
-    local tbl = rawget(_G, name)
-    if type(tbl) == "table" and #tbl > 8 then
-      -- 既にメタテーブルが設定されている場合はスキップ
-      local ok, mt = pcall(getmetatable, tbl)
-      if ok and mt == nil then
-        local orig_index = nil
-        local new_mt = {
-          __index = function(t, k)
-            local v = rawget(t, k)
-            -- アクセスが数値キーで値がテーブルなら instruction と見なす
-            if type(k) == "number" and type(v) == "table" then
-              __vmtrace_hook(k, v[1], v[2], v[3], v[4])
-            elseif type(k) == "number" and type(v) == "number" then
-              __vmtrace_hook(k, v, nil, nil, nil)
-            end
-            return v
-          end
-        }
-        -- setmetatable はエラーになりうるので pcall で保護
-        pcall(setmetatable, tbl, new_mt)
-      end
+-- ── [2] B テーブル プリダンプ ─────────────────────────────────────────
+-- injectVmHook が "local B = ..." の直後に __dump_B(B) を注入する
+function __dump_B(tbl)
+  if type(tbl) ~= "table" or #tbl == 0 then return end
+  if __bdump then return end  -- 初回のみキャプチャ
+  local lines = {}
+  for i = 1, #tbl do
+    local v = tbl[i]
+    if type(v) == "table" then
+      lines[#lines+1] = tostring(i).."\\t"..tostring(v[1] or "nil").."\\t"
+        ..tostring(v[2] or "nil").."\\t"..tostring(v[3] or "nil").."\\t"..tostring(v[4] or "nil")
+    elseif type(v) == "number" then
+      lines[#lines+1] = tostring(i).."\\t"..tostring(v).."\\tnil\\tnil\\tnil"
     end
   end
+  __bdump = lines
 end
--- 実行開始後に少し遅延してインターセプトを試みる
--- (VMの初期化が完了するのを待つため coroutine.wrap で遅延)
-local __intercept_installed = false
-local __orig_coroutine_wrap = coroutine and coroutine.wrap
-if __orig_coroutine_wrap then
-  pcall(function()
-    local co = coroutine.create(function()
-      coroutine.yield()
-      if not __intercept_installed then
-        __intercept_installed = true
-        __install_vm_intercept()
-      end
-    end)
-    coroutine.resume(co)
-  end)
+
+-- ── [2] V テーブル プリダンプ ─────────────────────────────────────────
+-- injectVmHook が "local V = ..." の直後に __dump_V(V) を注入する
+function __dump_V(tbl)
+  if type(tbl) ~= "table" then return end
+  if __vdump then return end
+  local lines = {}
+  for k, v in pairs(tbl) do
+    if type(k) == "number" then
+      local vs
+      if type(v) == "number" then vs = tostring(v)
+      elseif type(v) == "string" then vs = "S:"..v:sub(1, 64)
+      elseif type(v) == "boolean" then vs = tostring(v)
+      else vs = type(v) end
+      lines[#lines+1] = tostring(k).."\\t"..vs
+    end
+  end
+  __vdump = lines
 end
--- 即時もトライ（すでにテーブルが存在する場合）
-pcall(__install_vm_intercept)
+
+-- ── [3] __wrap_m: m(index) string accessor hook ───────────────────────
+-- injectVmHook が "local m = ..." の直後に m = __wrap_m(m) を注入する
+function __wrap_m(orig_m)
+  if type(orig_m) ~= "function" then return orig_m end
+  return function(idx)
+    local result = orig_m(idx)
+    if __strlog_count < __strlog_max then
+      __strlog_count = __strlog_count + 1
+      __strlog[__strlog_count] = {
+        i   = __strlog_count,
+        idx = idx,
+        val = type(result) == "string" and result or tostring(result),
+      }
+    end
+    return result
+  end
+end
 -- ══ Bootstrap End ══
 `;
 
@@ -1299,28 +1324,24 @@ pcall(__install_vm_intercept)
 //  #28  vmDumpFooter — __VMLOG__ 形式で stdout に出力
 // ────────────────────────────────────────────────────────────────────────
 const vmDumpFooter = `
--- ══ YAJU VM Dump Footer v4 ══
+-- ══ YAJU VM Dump Footer v6 (Weredev専用) ══
 
--- ── [1] string.char キャプチャログ出力 ────────────────────────────────
--- VM bytecode が string.char で構築されたバイト列をログに出す
+-- ── string.char キャプチャログ ────────────────────────────────────────
 if __strchar_count and __strchar_count > 0 then
   io.write("\\n__STRCHAR_START__\\n")
   for i = 1, math.min(__strchar_count, __strchar_max or 500) do
     local s = __strchar_log[i]
     if s then
-      -- 各バイトを10進数コンマ区切りで出力 (バイナリ安全)
       local bytes = {}
-      for j = 1, #s do
-        bytes[j] = tostring(s:byte(j))
-      end
-      io.write(tostring(i) .. "\\t" .. (#s) .. "\\t" .. table.concat(bytes, ",") .. "\\n")
+      for j = 1, #s do bytes[j] = tostring(s:byte(j)) end
+      io.write(tostring(i).."\\t"..(#s).."\\t"..table.concat(bytes,",").."\\n")
     end
   end
-  io.write("__STRCHAR_END__\\t" .. tostring(__strchar_count) .. "\\n")
+  io.write("__STRCHAR_END__\\t"..tostring(__strchar_count).."\\n")
   io.flush()
 end
 
--- ── [1] table.concat キャプチャログ出力 ──────────────────────────────
+-- ── table.concat キャプチャログ ──────────────────────────────────────
 if __tconcat_count and __tconcat_count > 0 then
   io.write("\\n__TCONCAT_START__\\n")
   for i = 1, math.min(__tconcat_count, __tconcat_max or 500) do
@@ -1328,41 +1349,99 @@ if __tconcat_count and __tconcat_count > 0 then
     if s then
       local bytes = {}
       for j = 1, #s do bytes[j] = tostring(s:byte(j)) end
-      io.write(tostring(i) .. "\\t" .. (#s) .. "\\t" .. table.concat(bytes, ",") .. "\\n")
+      io.write(tostring(i).."\\t"..(#s).."\\t"..table.concat(bytes,",").."\\n")
     end
   end
-  io.write("__TCONCAT_END__\\t" .. tostring(__tconcat_count) .. "\\n")
+  io.write("__TCONCAT_END__\\t"..tostring(__tconcat_count).."\\n")
   io.flush()
 end
 
--- ── 旧 __VMLOG__ 形式出力 (既存 parseVmLogs との互換) ────────────────
+-- ── [2] B テーブル (bytecode) JSON ダンプ ─────────────────────────────
+-- __dump_B() が injectVmHook により "local B=..." の直後に呼ばれ
+-- __bdump にライン配列が格納されている
+if __bdump and #__bdump > 0 then
+  io.write("\\n__BTABLE_START__\\n")
+  for _, line in ipairs(__bdump) do
+    io.write(line.."\\n")
+  end
+  io.write("__BTABLE_END__\\t"..tostring(#__bdump).."\\n")
+  io.flush()
+end
+
+-- フォールバック: __bdump が nil でも B がグローバルに残っていればダンプ
+if not __bdump and type(B) == "table" and #B > 0 then
+  io.write("\\n__BTABLE_START__\\n")
+  for i = 1, #B do
+    local v = B[i]
+    if type(v) == "table" then
+      io.write(tostring(i).."\\t"..tostring(v[1] or "nil").."\\t"
+        ..tostring(v[2] or "nil").."\\t"..tostring(v[3] or "nil").."\\t"..tostring(v[4] or "nil").."\\n")
+    elseif type(v) == "number" then
+      io.write(tostring(i).."\\t"..tostring(v).."\\tnil\\tnil\\tnil\\n")
+    end
+  end
+  io.write("__BTABLE_END__\\t"..tostring(#B).."\\n")
+  io.flush()
+end
+
+-- ── [2] V テーブル (レジスタ) JSON ダンプ ────────────────────────────
+if __vdump and #__vdump > 0 then
+  io.write("\\n__VTABLE_START__\\n")
+  for _, line in ipairs(__vdump) do io.write(line.."\\n") end
+  io.write("__VTABLE_END__\\t"..tostring(#__vdump).."\\n")
+  io.flush()
+end
+
+-- ── [3] m() string accessor ログ出力 ─────────────────────────────────
+if __strlog_count and __strlog_count > 0 then
+  io.write("\\n__STRLOG_START__\\n")
+  for i = 1, __strlog_count do
+    local e = __strlog[i]
+    if e then
+      local vs = tostring(e.val or ""):gsub("\\n","\\\\n"):gsub("\\t","\\\\t")
+      io.write(tostring(i).."\\t"..tostring(e.idx).."\\t"..vs.."\\n")
+    end
+  end
+  io.write("__STRLOG_END__\\t"..tostring(__strlog_count).."\\n")
+  io.flush()
+end
+
+-- ── 旧 __VMLOG__ (互換) ───────────────────────────────────────────────
 if __vm_log_count and __vm_log_count > 0 then
   for i, v in ipairs(__vm_logs) do
     local op   = tostring(v.op   or "nil")
     local arg1 = tostring(v.arg1 or "nil")
     local arg2 = tostring(v.arg2 or "nil")
     local arg3 = tostring(v.arg3 or "nil")
-    print("__VMLOG__\\t" .. tostring(v.ip) .. "\\t" .. op .. "\\t" .. arg1 .. "\\t" .. arg2 .. "\\t" .. arg3)
+    print("__VMLOG__\\t"..tostring(v.ip).."\\t"..op.."\\t"..arg1.."\\t"..arg2.."\\t"..arg3)
   end
-  print("__VMLOG_END__\\t" .. tostring(__vm_log_count))
+  print("__VMLOG_END__\\t"..tostring(__vm_log_count))
 end
 
--- ── [3] __VMTRACE_START__ / __VMTRACE_END__: instruction trace ダンプ ─
--- フォーマット: idx \\t ip \\t op \\t a \\t b \\t c (タブ区切り)
+-- ── [1] __VMTRACE_START__ / __VMTRACE_END__ ───────────────────────────
+-- フォーマット: idx \\t pc \\t l(opcode) \\t A \\t B \\t C \\t regs(k=v,...)
 if __vmtrace_count and __vmtrace_count > 0 then
   io.write("\\n__VMTRACE_START__\\n")
   for i = 1, __vmtrace_count do
     local v = __vmtrace[i]
     if v then
-      local ip_s = tostring(v.ip or 0)
-      local op_s = tostring(v.op or "nil")
-      local a_s  = tostring(v.a  or "nil")
-      local b_s  = tostring(v.b  or "nil")
-      local c_s  = tostring(v.c  or "nil")
-      io.write(tostring(i).."\\t"..ip_s.."\\t"..op_s.."\\t"..a_s.."\\t"..b_s.."\\t"..c_s.."\\n")
+      local pc_s = tostring(v.pc or 0)
+      local l_s  = tostring(v.l  or "nil")
+      local a_s  = tostring(v.A  or "nil")
+      local b_s  = tostring(v.B  or "nil")
+      local c_s  = tostring(v.C  or "nil")
+      local regs_s = "nil"
+      if type(v.regs) == "table" then
+        local parts = {}
+        for rk, rv in pairs(v.regs) do
+          parts[#parts+1] = tostring(rk).."="..tostring(rv)
+        end
+        if #parts > 0 then regs_s = table.concat(parts, ",") end
+      end
+      io.write(tostring(i).."\\t"..pc_s.."\\t"..l_s.."\\t"..a_s.."\\t"..b_s.."\\t"..c_s.."\\t"..regs_s.."\\n")
     end
   end
-  io.write("__VMTRACE_END__\\t" .. tostring(__vmtrace_count) .. "\\n")
+  io.write("__VMTRACE_END__\\t"..tostring(__vmtrace_count).."\\n")
   io.flush()
 end
 -- ══ Dump End ══
@@ -1374,85 +1453,151 @@ end
 // ────────────────────────────────────────────────────────────────────────
 function injectVmHook(code, vmInfo) {
   let modified = code;
-  let injected  = false;
-  const type_   = vmInfo || {};
+  let injectedTrace = false;
+  let injectedBDump = false;
+  let injectedVDump = false;
+  let injectedMHook = false;
+  const type_ = vmInfo || {};
 
-  // [2] WereDev パターン: local inst = bytecode[ip] の直後に trace hook を注入
-  // opcode は inst[1], a=inst[2], b=inst[3], c=inst[4]
-  if (!injected || type_.isWereDev) {
+  // ══ [2] B テーブル プリダンプ注入 ══════════════════════════════════════
+  // "local B = ..." の直後に __dump_B(B) を挿入
+  // Weredev は "local B={...}" または "local B=proto.code" などの形式
+  modified = modified.replace(
+    /(local\s+B\s*=\s*[^\n]+\n)/g,
+    (match) => {
+      if (injectedBDump) return match;
+      injectedBDump = true;
+      return match + '  __dump_B(B)\n';
+    }
+  );
+
+  // ══ [2] V テーブル プリダンプ注入 ══════════════════════════════════════
+  // "local V = ..." の直後に __dump_V(V) を挿入
+  modified = modified.replace(
+    /(local\s+V\s*=\s*[^\n]+\n)/g,
+    (match) => {
+      if (injectedVDump) return match;
+      injectedVDump = true;
+      return match + '  __dump_V(V)\n';
+    }
+  );
+
+  // ══ [3] m() string accessor フック注入 ═════════════════════════════════
+  // "local m = ..." の直後に m = __wrap_m(m) を挿入
+  modified = modified.replace(
+    /(local\s+m\s*=\s*[^\n]+\n)/g,
+    (match) => {
+      if (injectedMHook) return match;
+      injectedMHook = true;
+      return match + '  m = __wrap_m(m)\n';
+    }
+  );
+
+  // ══ [1] while dispatch ループ内 opcode(l) trace 注入 ═══════════════════
+  // パターン A (Weredev 最頻出):
+  //   local l = B[pc]
+  //   → 直後に __vmtrace_hook(pc, l, l and l[2], l and l[3], l and l[4])
+  modified = modified.replace(
+    /(local\s+l\s*=\s*B\s*\[\s*pc\s*\][^\n]*\n)/g,
+    (match) => {
+      injectedTrace = true;
+      return match
+        + '  __vmtrace_hook(pc, type(l)=="table" and l[1] or l,'
+        + ' type(l)=="table" and l[2] or nil,'
+        + ' type(l)=="table" and l[3] or nil,'
+        + ' type(l)=="table" and l[4] or nil)\n';
+    }
+  );
+
+  // パターン B: Weredev スカラーopcode形式
+  //   local l = B[pc][1]  または  local opcode = B[pc]
+  if (!injectedTrace) {
+    modified = modified.replace(
+      /(local\s+(?:l|opcode)\s*=\s*B\s*\[\s*pc\s*\]\s*\[\s*1\s*\][^\n]*\n)/g,
+      (match) => {
+        injectedTrace = true;
+        return match + '  __vmtrace_hook(pc, l or opcode, nil, nil, nil)\n';
+      }
+    );
+  }
+
+  // パターン C: 旧来の inst = bytecode[ip] 形式 (Weredev旧版 / 互換)
+  if (!injectedTrace || type_.isWereDev) {
     modified = modified.replace(
       /(local\s+inst\s*=\s*bytecode\s*\[\s*ip\s*\][^\n]*\n)/g,
       (match) => {
-        injected = true;
+        injectedTrace = true;
         return match
-          + '  __vmtrace_hook(ip, inst and inst[1], inst and inst[2], inst and inst[3], inst and inst[4])\n'
+          + '  __vmtrace_hook(ip, inst and inst[1], inst and inst[2],'
+          + ' inst and inst[3], inst and inst[4])\n'
           + '  __vmhook(ip, inst)\n';
       }
     );
   }
 
-  // [2] MoonSec パターン: dispatch[opcode]( の直前に trace hook を注入
-  if (!injected || type_.isMoonSec) {
+  // パターン D: MoonSec — dispatch[opcode](
+  if (!injectedTrace || type_.isMoonSec) {
     modified = modified.replace(
       /(dispatch\s*\[\s*opcode\s*\]\s*\()/g,
       (match) => {
-        injected = true;
+        injectedTrace = true;
         return `__vmtrace_hook(ip, opcode, nil, nil, nil); __vmhook(ip, opcode); ` + match;
       }
     );
     modified = modified.replace(
       /(dispatch\s*\[\s*inst\s*\[\s*1\s*\]\s*\]\s*\()/g,
       (match) => {
-        injected = true;
+        injectedTrace = true;
         return `__vmtrace_hook(ip, inst and inst[1], inst and inst[2], inst and inst[3], inst and inst[4]); __vmhook(ip, inst); ` + match;
       }
     );
   }
 
-  // [2] Luraph パターン
+  // パターン E: Luraph
   if (type_.isLuraph) {
-    modified = modified.replace(
-      /\bLPH_GetEnv\s*\(/g,
-      (match) => { injected = true; return `__vmtrace_hook(0, "LPH_GetEnv", nil, nil, nil); __vmhook(0, "LPH_GetEnv"); ` + match; }
-    );
-    modified = modified.replace(
-      /\bLPH_String\s*\(/g,
-      (match) => { injected = true; return `__vmtrace_hook(0, "LPH_String", nil, nil, nil); __vmhook(0, "LPH_String"); ` + match; }
-    );
+    modified = modified.replace(/\bLPH_GetEnv\s*\(/g, (m) => {
+      injectedTrace = true;
+      return `__vmtrace_hook(0, "LPH_GetEnv", nil, nil, nil); __vmhook(0, "LPH_GetEnv"); ` + m;
+    });
+    modified = modified.replace(/\bLPH_String\s*\(/g, (m) => {
+      injectedTrace = true;
+      return `__vmtrace_hook(0, "LPH_String", nil, nil, nil); __vmhook(0, "LPH_String"); ` + m;
+    });
   }
 
-  // [2] while true do / repeat until ループ直後への汎用注入
+  // パターン F: 汎用 while true do ループ先頭 (フォールバック)
   modified = modified.replace(
     /(while\s+true\s+do\s*\n)/g,
     (match) => {
-      injected = true;
-      return match + '  __vmtrace_hook(ip, inst and inst[1] or opcode, inst and inst[2], inst and inst[3], inst and inst[4])\n'
-                   + '  __vmhook(ip, inst, stack, reg)\n';
-    }
-  );
-  modified = modified.replace(
-    /(repeat\s*\n)/g,
-    (match) => {
-      injected = true;
-      return match + '  __vmtrace_hook(ip, inst and inst[1] or opcode, inst and inst[2], inst and inst[3], inst and inst[4])\n'
-                   + '  __vmhook(ip, inst, stack, reg)\n';
+      injectedTrace = true;
+      // l が存在すれば l、なければ inst or opcode を使う
+      return match
+        + '  if __vmtrace_hook then\n'
+        + '    __vmtrace_hook(pc or ip or 0,'
+        + ' type(l)=="table" and l[1] or l or (inst and inst[1]) or opcode,'
+        + ' type(l)=="table" and l[2] or (inst and inst[2]),'
+        + ' type(l)=="table" and l[3] or (inst and inst[3]),'
+        + ' type(l)=="table" and l[4] or (inst and inst[4]))\n'
+        + '  end\n';
     }
   );
 
-  // 汎用フォールバック: local opcode = の次行
-  if (!injected) {
+  // パターン G: 汎用フォールバック local opcode =
+  if (!injectedTrace) {
     modified = modified.replace(
       /(local\s+opcode\s*=\s*[^\n]+\n)/g,
       (match) => {
-        injected = true;
-        return match
-          + '  __vmtrace_hook(ip, opcode, nil, nil, nil)\n'
-          + '  __vmhook(ip, opcode)\n';
+        injectedTrace = true;
+        return match + '  __vmtrace_hook(ip, opcode, nil, nil, nil)\n  __vmhook(ip, opcode)\n';
       }
     );
   }
 
-  return { code: modified, injected };
+  const injected = injectedTrace || injectedBDump || injectedVDump || injectedMHook;
+  return {
+    code: modified, injected,
+    injectedTrace, injectedBDump, injectedVDump, injectedMHook,
+  };
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -1493,59 +1638,151 @@ function parseVmLogs(stdout) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  [4] parseVmTrace — __VMTRACE_START__ / __VMTRACE_END__ を検出して
-//       instruction trace を構造化データとして取得する
+//  parseVmTrace v6 — __VMTRACE_START__ / __VMTRACE_END__
+//  フォーマット: idx \t pc \t l(opcode) \t A \t B \t C \t regs(k=v,...)
 // ────────────────────────────────────────────────────────────────────────
 function parseVmTrace(stdout) {
   if (!stdout) return { entries: [], count: 0, found: false };
 
   const startMarker = '__VMTRACE_START__';
   const endMarker   = '__VMTRACE_END__';
-
   const startIdx = stdout.indexOf(startMarker);
   const endIdx   = stdout.indexOf(endMarker);
-
-  // マーカーが存在しない場合は空で返す
-  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx)
     return { entries: [], count: 0, found: false };
-  }
 
-  // マーカー間のテキストを切り出す
   const rawBlock = stdout.substring(startIdx + startMarker.length, endIdx).trim();
   if (!rawBlock) return { entries: [], count: 0, found: false };
 
+  const toVal = (s) => {
+    if (s === undefined || s === 'nil' || s === '') return null;
+    const n = Number(s);
+    return isNaN(n) ? s : n;
+  };
+
   const entries = [];
-  const lines = rawBlock.split('\n');
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    // フォーマット: idx \t ip \t op \t a \t b \t c
-    const parts = trimmed.split('\t');
-    if (parts.length < 3) continue;
-
-    const toVal = (s) => {
-      if (s === undefined || s === 'nil') return null;
-      const n = Number(s);
-      return isNaN(n) ? s : (Number.isInteger(n) ? n : n);
-    };
-
-    const idx = parseInt(parts[0]) || 0;
-    const ip  = toVal(parts[1]);
-    const op  = toVal(parts[2]);
-    const a   = toVal(parts[3]);
-    const b   = toVal(parts[4]);
-    const c   = toVal(parts[5]);
-
-    entries.push({ idx, ip, op, a, b, c });
+  for (const line of rawBlock.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    // idx \t pc \t l \t A \t B \t C \t regs
+    const p = t.split('\t');
+    if (p.length < 3) continue;
+    const idx  = parseInt(p[0]) || 0;
+    const pc   = toVal(p[1]);
+    const l    = toVal(p[2]);   // opcode
+    const A    = toVal(p[3]);
+    const B    = toVal(p[4]);
+    const C    = toVal(p[5]);
+    // regs: "0=val,1=val,..." → オブジェクト
+    const regs = {};
+    if (p[6] && p[6] !== 'nil') {
+      for (const kv of p[6].split(',')) {
+        const eq = kv.indexOf('=');
+        if (eq !== -1) {
+          const k = parseInt(kv.substring(0, eq));
+          const v = toVal(kv.substring(eq + 1));
+          if (!isNaN(k)) regs[k] = v;
+        }
+      }
+    }
+    // 互換用に ip/op/a/b/c も設定
+    entries.push({ idx, pc, l, A, B, C, regs, ip: pc, op: l, a: A, b: B, c: C });
   }
 
-  // __VMTRACE_END__ の後ろのカウント取得
-  const endLine = stdout.substring(endIdx, stdout.indexOf('\n', endIdx));
+  const endLine = stdout.substring(endIdx, stdout.indexOf('\n', endIdx) + 1);
   const countMatch = endLine.match(/__VMTRACE_END__\t(\d+)/);
-  const reportedCount = countMatch ? parseInt(countMatch[1]) : entries.length;
+  return { entries, count: countMatch ? parseInt(countMatch[1]) : entries.length, found: true };
+}
 
-  return { entries, count: reportedCount, found: true };
+// ────────────────────────────────────────────────────────────────────────
+//  [2] parseBTableLog — __BTABLE_START__ / __BTABLE_END__
+//  Weredev B テーブル (bytecode instructions) をパース
+//  フォーマット: idx \t opcode \t A \t B \t C
+// ────────────────────────────────────────────────────────────────────────
+function parseBTableLog(stdout) {
+  if (!stdout) return { instructions: [], count: 0, found: false };
+  const si = stdout.indexOf('__BTABLE_START__');
+  const ei = stdout.indexOf('__BTABLE_END__');
+  if (si === -1 || ei === -1 || ei <= si) return { instructions: [], count: 0, found: false };
+
+  const raw = stdout.substring(si + '__BTABLE_START__'.length, ei).trim();
+  const instructions = [];
+  const toV = (s) => (s === undefined || s === 'nil') ? null : (isNaN(Number(s)) ? s : Number(s));
+
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    const p = t.split('\t');
+    if (p.length < 2) continue;
+    instructions.push({
+      idx: parseInt(p[0]) || 0,
+      op:  toV(p[1]),
+      A:   toV(p[2]),
+      B:   toV(p[3]),
+      C:   toV(p[4]),
+    });
+  }
+  const endLine = stdout.substring(ei, stdout.indexOf('\n', ei) + 1);
+  const cm = endLine.match(/__BTABLE_END__\t(\d+)/);
+  return { instructions, count: cm ? parseInt(cm[1]) : instructions.length, found: true };
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  [2] parseVTableLog — __VTABLE_START__ / __VTABLE_END__
+//  Weredev V テーブル (registers) 初期状態をパース
+//  フォーマット: reg_idx \t value
+// ────────────────────────────────────────────────────────────────────────
+function parseVTableLog(stdout) {
+  if (!stdout) return { registers: {}, count: 0, found: false };
+  const si = stdout.indexOf('__VTABLE_START__');
+  const ei = stdout.indexOf('__VTABLE_END__');
+  if (si === -1 || ei === -1 || ei <= si) return { registers: {}, count: 0, found: false };
+
+  const raw = stdout.substring(si + '__VTABLE_START__'.length, ei).trim();
+  const registers = {};
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    const p = t.split('\t');
+    if (p.length < 2) continue;
+    const k = parseInt(p[0]);
+    if (!isNaN(k)) {
+      const v = p[1];
+      registers[k] = v.startsWith('S:') ? v.substring(2) : (isNaN(Number(v)) ? v : Number(v));
+    }
+  }
+  const endLine = stdout.substring(ei, stdout.indexOf('\n', ei) + 1);
+  const cm = endLine.match(/__VTABLE_END__\t(\d+)/);
+  return { registers, count: cm ? parseInt(cm[1]) : Object.keys(registers).length, found: true };
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  [3] parseStrLog — __STRLOG_START__ / __STRLOG_END__
+//  m(index) string accessor でアクセスされた文字列ログをパース
+//  フォーマット: idx \t key_index \t value
+// ────────────────────────────────────────────────────────────────────────
+function parseStrLog(stdout) {
+  if (!stdout) return { entries: [], count: 0, found: false };
+  const si = stdout.indexOf('__STRLOG_START__');
+  const ei = stdout.indexOf('__STRLOG_END__');
+  if (si === -1 || ei === -1 || ei <= si) return { entries: [], count: 0, found: false };
+
+  const raw = stdout.substring(si + '__STRLOG_START__'.length, ei).trim();
+  const entries = [];
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    const p = t.split('\t');
+    if (p.length < 3) continue;
+    entries.push({
+      i:   parseInt(p[0]) || 0,
+      idx: isNaN(Number(p[1])) ? p[1] : Number(p[1]),
+      val: p[2].replace(/\\n/g, '\n').replace(/\\t/g, '\t'),
+    });
+  }
+  const endLine = stdout.substring(ei, stdout.indexOf('\n', ei) + 1);
+  const cm = endLine.match(/__STRLOG_END__\t(\d+)/);
+  return { entries, count: cm ? parseInt(cm[1]) : entries.length, found: true };
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -2391,34 +2628,42 @@ end
 
       // 旧 __VMLOG__ 形式のトレース（互換）
       const vmTrace      = parseVmLogs(stdout);
-      // [4] 新 __VMTRACE__ 形式のトレース（WereDev カスタム VM 対応）
+      // [1] 新 __VMTRACE__ 形式（Weredev l/A/B/C/regs フォーマット）
       const vmTraceNew   = parseVmTrace(stdout);
-      // [1] string.char / table.concat キャプチャ (VM bytecode 取得)
+      // [2] B/V テーブルパース（Weredev bytecode / registers）
+      const bTableLog    = parseBTableLog(stdout);
+      const vTableLog    = parseVTableLog(stdout);
+      // [3] m() string accessor ログ
+      const strLog       = parseStrLog(stdout);
+      // string.char / table.concat キャプチャ
       const strCharLog   = parseStrCharLog(stdout);
       const tConcatLog   = parseTConcatLog(stdout);
       const bytecodeDump = parseBytecodeDump(stdout);
 
-      // vmTrace を統合（新形式を優先、なければ旧形式）
+      // vmTrace 統合（新形式優先、フォールバックは旧形式）
       const traceForAnalysis = vmTraceNew.found
-        ? vmTraceNew.entries.map(e => ({ ip: e.ip || 0, op: e.op, arg1: e.a, arg2: e.b, arg3: e.c }))
+        ? vmTraceNew.entries.map(e => ({ ip: e.pc || 0, op: e.l, arg1: e.A, arg2: e.B, arg3: e.C }))
         : vmTrace;
 
       const wereDevDetected = checkWereDevDetected(traceForAnalysis);
-
-      // vmトレースをJSONで保存
       if (traceForAnalysis.length > 0) saveVmTrace(traceForAnalysis, Date.now());
 
       const vmAnalysis = {
-        vmTrace: traceForAnalysis,
-        vmTraceRaw:  vmTraceNew.found  ? vmTraceNew  : null,
-        strCharLog:  strCharLog.found  ? strCharLog  : null,  // [1]
-        tConcatLog:  tConcatLog.found  ? tConcatLog  : null,  // [1]
+        vmTrace:      traceForAnalysis,
+        vmTraceRaw:   vmTraceNew.found  ? vmTraceNew  : null,   // [1] l/A/B/C/regs
+        bTable:       bTableLog.found   ? bTableLog   : null,   // [2] bytecode
+        vTable:       vTableLog.found   ? vTableLog   : null,   // [2] registers
+        strLog:       strLog.found      ? strLog      : null,   // [3] m() strings
+        strCharLog:   strCharLog.found  ? strCharLog  : null,
+        tConcatLog:   tConcatLog.found  ? tConcatLog  : null,
         bytecodeDump,
         wereDevDetected,
         vmHookInjected,
         bytecodeCandidates,
         vmInfo,
-        traceCount: vmTraceNew.found ? vmTraceNew.count : vmTrace.length,
+        traceCount:   vmTraceNew.found  ? vmTraceNew.count : vmTrace.length,
+        bTableCount:  bTableLog.found   ? bTableLog.count  : 0,
+        strLogCount:  strLog.found      ? strLog.count      : 0,
       };
       if (wereDevDetected) {
         vmAnalysis.traceAnalysis  = vmTraceAnalyzer(traceForAnalysis);
