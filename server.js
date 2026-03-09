@@ -1152,27 +1152,52 @@ function deobfuscateVmify(code) {
 //  #26/#27/#28/#29  vmHookBootstrap 強化版
 // ────────────────────────────────────────────────────────────────────────
 const vmHookBootstrap = `
--- ══ YAJU VM Hook Bootstrap v2 ══
+-- ══ YAJU VM Hook Bootstrap v3 ══
 __vm_logs     = {}
 __vm_log_count = 0
-__vm_max_logs  = 5000   -- #27: 2000→5000に増加
+__vm_max_logs  = 5000
 
--- #28: ip opcode arg1 arg2 を __VMLOG__ プレフィックスで出力
--- #29: type(inst) ~= "table" ガード追加
+-- [1] __vmtrace: WereDev カスタム VM instruction trace テーブル
+__vmtrace       = {}
+__vmtrace_count = 0
+__vmtrace_max   = 10000  -- 最大 10000 命令まで記録
+
+-- [1][2] VM instruction trace hook
+-- opcode / a / b / c を __vmtrace に蓄積する
+-- 呼び出し規約: __vmtrace_hook(ip, opcode, a, b, c)
+--   ip     : instruction pointer (数値 or nil)
+--   opcode : opcode 番号 or 名前
+--   a,b,c  : オペランド (省略可)
+function __vmtrace_hook(ip, opcode, a, b, c)
+  if __vmtrace_count >= __vmtrace_max then return end
+  __vmtrace_count = __vmtrace_count + 1
+  local entry = {
+    i  = __vmtrace_count,
+    ip = ip or 0,
+    op = opcode,
+    a  = a,
+    b  = b,
+    c  = c,
+  }
+  __vmtrace[__vmtrace_count] = entry
+end
+
+-- 旧来の __vmhook も維持 (既存注入コードとの互換)
 function __vmhook(ip, inst, stack, reg)
   if __vm_log_count >= __vm_max_logs then return end
   __vm_log_count = __vm_log_count + 1
-  -- #29: inst が table でなければ早期リターン
   if inst ~= nil and type(inst) ~= "table" and type(inst) ~= "number" then return end
   local entry = { ip = ip, ts = __vm_log_count }
   if type(inst) == "table" then
-    -- #29: type check 追加
     if type(inst[1]) ~= "nil" then entry.op   = inst[1] end
     if type(inst[2]) ~= "nil" then entry.arg1 = inst[2] end
     if type(inst[3]) ~= "nil" then entry.arg2 = inst[3] end
     if type(inst[4]) ~= "nil" then entry.arg3 = inst[4] end
+    -- [1] __vmtrace にも転送
+    __vmtrace_hook(ip, inst[1], inst[2], inst[3], inst[4])
   elseif type(inst) == "number" then
     entry.op = inst
+    __vmtrace_hook(ip, inst, nil, nil, nil)
   end
   table.insert(__vm_logs, entry)
 end
@@ -1183,9 +1208,10 @@ end
 //  #28  vmDumpFooter — __VMLOG__ 形式で stdout に出力
 // ────────────────────────────────────────────────────────────────────────
 const vmDumpFooter = `
--- ══ YAJU VM Dump Footer v2 ══
+-- ══ YAJU VM Dump Footer v3 ══
+
+-- 旧 __VMLOG__ 形式出力 (既存 parseVmLogs との互換)
 if __vm_log_count and __vm_log_count > 0 then
-  -- #28: ip\topcode\targ1\targ2 形式
   for i, v in ipairs(__vm_logs) do
     local op   = tostring(v.op   or "nil")
     local arg1 = tostring(v.arg1 or "nil")
@@ -1194,6 +1220,27 @@ if __vm_log_count and __vm_log_count > 0 then
     print("__VMLOG__\t" .. tostring(v.ip) .. "\t" .. op .. "\t" .. arg1 .. "\t" .. arg2 .. "\t" .. arg3)
   end
   print("__VMLOG_END__\t" .. tostring(__vm_log_count))
+end
+
+-- [3] __VMTRACE__ 形式出力: JSON-lines で instruction trace をダンプ
+-- server.js の parseVmTrace() が __VMTRACE_START__ / __VMTRACE_END__ を検出して読み込む
+if __vmtrace_count and __vmtrace_count > 0 then
+  io.write("\\n__VMTRACE_START__\\n")
+  for i = 1, __vmtrace_count do
+    local v = __vmtrace[i]
+    if v then
+      -- 各フィールドを安全に文字列化
+      local ip_s  = tostring(v.ip  or 0)
+      local op_s  = tostring(v.op  or "nil")
+      local a_s   = tostring(v.a   or "nil")
+      local b_s   = tostring(v.b   or "nil")
+      local c_s   = tostring(v.c   or "nil")
+      -- タブ区切り: idx \\t ip \\t op \\t a \\t b \\t c
+      io.write(tostring(i) .. "\\t" .. ip_s .. "\\t" .. op_s .. "\\t" .. a_s .. "\\t" .. b_s .. "\\t" .. c_s .. "\\n")
+    end
+  end
+  io.write("__VMTRACE_END__\\t" .. tostring(__vmtrace_count) .. "\\n")
+  io.flush()
 end
 -- ══ Dump End ══
 `;
@@ -1207,54 +1254,78 @@ function injectVmHook(code, vmInfo) {
   let injected  = false;
   const type_   = vmInfo || {};
 
-  // #30: while true do / repeat until の直後に __vmhook を挿入
-  // #24: パターンを /while\s+true\s+do|repeat\s+until/ に拡張
-  modified = modified.replace(
-    /(while\s+true\s+do\s*\n)/g,
-    (match) => { injected = true; return match + '  __vmhook(ip, inst, stack, reg)\n'; }
-  );
-  modified = modified.replace(
-    /(repeat\s*\n)/g,
-    (match) => { injected = true; return match + '  __vmhook(ip, inst, stack, reg)\n'; }
-  );
-
-  // #31: WereDev — bytecode[ip] 実行前に hook を挿入
+  // [2] WereDev パターン: local inst = bytecode[ip] の直後に trace hook を注入
+  // opcode は inst[1], a=inst[2], b=inst[3], c=inst[4]
   if (!injected || type_.isWereDev) {
     modified = modified.replace(
       /(local\s+inst\s*=\s*bytecode\s*\[\s*ip\s*\][^\n]*\n)/g,
-      (match) => { injected = true; return match + '  __vmhook(ip, inst)\n'; }
+      (match) => {
+        injected = true;
+        return match
+          + '  __vmtrace_hook(ip, inst and inst[1], inst and inst[2], inst and inst[3], inst and inst[4])\n'
+          + '  __vmhook(ip, inst)\n';
+      }
     );
   }
 
-  // #32: MoonSec — dispatch[opcode] 呼び出し前に hook を挿入
+  // [2] MoonSec パターン: dispatch[opcode]( の直前に trace hook を注入
   if (!injected || type_.isMoonSec) {
     modified = modified.replace(
       /(dispatch\s*\[\s*opcode\s*\]\s*\()/g,
-      (match) => { injected = true; return `__vmhook(ip, opcode); ` + match; }
+      (match) => {
+        injected = true;
+        return `__vmtrace_hook(ip, opcode, nil, nil, nil); __vmhook(ip, opcode); ` + match;
+      }
     );
     modified = modified.replace(
       /(dispatch\s*\[\s*inst\s*\[\s*1\s*\]\s*\]\s*\()/g,
-      (match) => { injected = true; return `__vmhook(ip, inst); ` + match; }
+      (match) => {
+        injected = true;
+        return `__vmtrace_hook(ip, inst and inst[1], inst and inst[2], inst and inst[3], inst and inst[4]); __vmhook(ip, inst); ` + match;
+      }
     );
   }
 
-  // #33: Luraph — LPH_GetEnv 呼び出しをフック
+  // [2] Luraph パターン
   if (type_.isLuraph) {
     modified = modified.replace(
       /\bLPH_GetEnv\s*\(/g,
-      (match) => { injected = true; return `__vmhook(0, "LPH_GetEnv"); ` + match; }
+      (match) => { injected = true; return `__vmtrace_hook(0, "LPH_GetEnv", nil, nil, nil); __vmhook(0, "LPH_GetEnv"); ` + match; }
     );
     modified = modified.replace(
       /\bLPH_String\s*\(/g,
-      (match) => { injected = true; return `__vmhook(0, "LPH_String"); ` + match; }
+      (match) => { injected = true; return `__vmtrace_hook(0, "LPH_String", nil, nil, nil); __vmhook(0, "LPH_String"); ` + match; }
     );
   }
+
+  // [2] while true do / repeat until ループ直後への汎用注入
+  modified = modified.replace(
+    /(while\s+true\s+do\s*\n)/g,
+    (match) => {
+      injected = true;
+      return match + '  __vmtrace_hook(ip, inst and inst[1] or opcode, inst and inst[2], inst and inst[3], inst and inst[4])\n'
+                   + '  __vmhook(ip, inst, stack, reg)\n';
+    }
+  );
+  modified = modified.replace(
+    /(repeat\s*\n)/g,
+    (match) => {
+      injected = true;
+      return match + '  __vmtrace_hook(ip, inst and inst[1] or opcode, inst and inst[2], inst and inst[3], inst and inst[4])\n'
+                   + '  __vmhook(ip, inst, stack, reg)\n';
+    }
+  );
 
   // 汎用フォールバック: local opcode = の次行
   if (!injected) {
     modified = modified.replace(
       /(local\s+opcode\s*=\s*[^\n]+\n)/g,
-      (match) => { injected = true; return match + '  __vmhook(ip, opcode)\n'; }
+      (match) => {
+        injected = true;
+        return match
+          + '  __vmtrace_hook(ip, opcode, nil, nil, nil)\n'
+          + '  __vmhook(ip, opcode)\n';
+      }
     );
   }
 
@@ -1282,7 +1353,7 @@ function parseVmLogs(stdout) {
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed.startsWith('__VMLOG__')) continue;
-    // #35: split("\t") で ip opcode arg1 arg2 を構造化
+    // split("\t") で ip opcode arg1 arg2 を構造化
     const parts = trimmed.split('\t');
     if (parts.length < 3) continue;
     const ip   = parseInt(parts[1]) || 0;
@@ -1296,6 +1367,62 @@ function parseVmLogs(stdout) {
     vmTrace.push({ ip, op, arg1, arg2, arg3 });
   }
   return vmTrace;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  [4] parseVmTrace — __VMTRACE_START__ / __VMTRACE_END__ を検出して
+//       instruction trace を構造化データとして取得する
+// ────────────────────────────────────────────────────────────────────────
+function parseVmTrace(stdout) {
+  if (!stdout) return { entries: [], count: 0, found: false };
+
+  const startMarker = '__VMTRACE_START__';
+  const endMarker   = '__VMTRACE_END__';
+
+  const startIdx = stdout.indexOf(startMarker);
+  const endIdx   = stdout.indexOf(endMarker);
+
+  // マーカーが存在しない場合は空で返す
+  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+    return { entries: [], count: 0, found: false };
+  }
+
+  // マーカー間のテキストを切り出す
+  const rawBlock = stdout.substring(startIdx + startMarker.length, endIdx).trim();
+  if (!rawBlock) return { entries: [], count: 0, found: false };
+
+  const entries = [];
+  const lines = rawBlock.split('\n');
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    // フォーマット: idx \t ip \t op \t a \t b \t c
+    const parts = trimmed.split('\t');
+    if (parts.length < 3) continue;
+
+    const toVal = (s) => {
+      if (s === undefined || s === 'nil') return null;
+      const n = Number(s);
+      return isNaN(n) ? s : (Number.isInteger(n) ? n : n);
+    };
+
+    const idx = parseInt(parts[0]) || 0;
+    const ip  = toVal(parts[1]);
+    const op  = toVal(parts[2]);
+    const a   = toVal(parts[3]);
+    const b   = toVal(parts[4]);
+    const c   = toVal(parts[5]);
+
+    entries.push({ idx, ip, op, a, b, c });
+  }
+
+  // __VMTRACE_END__ の後ろのカウント取得
+  const endLine = stdout.substring(endIdx, stdout.indexOf('\n', endIdx));
+  const countMatch = endLine.match(/__VMTRACE_END__\t(\d+)/);
+  const reportedCount = countMatch ? parseInt(countMatch[1]) : entries.length;
+
+  return { entries, count: reportedCount, found: true };
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -2076,22 +2203,39 @@ end
     exec(`${luaBin} ${tempFile}`, { timeout: 3000, maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
       try { fs.unlinkSync(tempFile); } catch {}
 
-      // #9: __DECODED__ 抽出 (scoreLuaCode フィルター付き #10)
+      // __DECODED__ 抽出
       const decoded = parseDecodedOutputs(stdout);
 
-      // VMログ抽出 (#34/#35)
+      // 旧 __VMLOG__ 形式のトレース（互換）
       const vmTrace      = parseVmLogs(stdout);
+      // [4] 新 __VMTRACE__ 形式のトレース（WereDev カスタム VM 対応）
+      const vmTraceNew   = parseVmTrace(stdout);
       const bytecodeDump = parseBytecodeDump(stdout);
-      const wereDevDetected = checkWereDevDetected(vmTrace);
 
-      // #36: vmトレースをJSONで保存
-      if (vmTrace.length > 0) saveVmTrace(vmTrace, Date.now());
+      // vmTrace を統合（新形式を優先、なければ旧形式）
+      const traceForAnalysis = vmTraceNew.found
+        ? vmTraceNew.entries.map(e => ({ ip: e.ip || 0, op: e.op, arg1: e.a, arg2: e.b, arg3: e.c }))
+        : vmTrace;
 
-      const vmAnalysis = { vmTrace, bytecodeDump, wereDevDetected, vmHookInjected, bytecodeCandidates, vmInfo };
+      const wereDevDetected = checkWereDevDetected(traceForAnalysis);
+
+      // vmトレースをJSONで保存
+      if (traceForAnalysis.length > 0) saveVmTrace(traceForAnalysis, Date.now());
+
+      const vmAnalysis = {
+        vmTrace: traceForAnalysis,
+        vmTraceRaw: vmTraceNew.found ? vmTraceNew : null,  // [4] 生の新形式トレース
+        bytecodeDump,
+        wereDevDetected,
+        vmHookInjected,
+        bytecodeCandidates,
+        vmInfo,
+        traceCount: vmTraceNew.found ? vmTraceNew.count : vmTrace.length,
+      };
       if (wereDevDetected) {
-        vmAnalysis.traceAnalysis  = vmTraceAnalyzer(vmTrace);    // #37/#38/#39
-        vmAnalysis.reconstruction = vmDecompiler(               // #40-#52
-          vmTrace, bytecodeDump, vmAnalysis.traceAnalysis.opcodeMap
+        vmAnalysis.traceAnalysis  = vmTraceAnalyzer(traceForAnalysis);
+        vmAnalysis.reconstruction = vmDecompiler(
+          traceForAnalysis, bytecodeDump, vmAnalysis.traceAnalysis.opcodeMap
         );
       }
 
