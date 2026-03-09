@@ -56,7 +56,7 @@ app.get('/api/status', (req, res) => {
     status: 'ok',
     lua: checkLuaAvailable() || 'not installed',
     prometheus: checkPrometheusAvailable() ? 'available' : 'not found',
-    deobfuscateMethods: ['auto','advanced_static','eval_expressions','split_strings','xor','constant_array','dynamic','vmify','char_decoder','xor_decoder','math_eval','constant_call','str_transform','dead_branch','junk_clean','vm_detect','vm_extract','base64_detect'],
+    deobfuscateMethods: ['auto','advanced_static','eval_expressions','split_strings','xor','constant_array','dynamic','vmify','char_decoder','xor_decoder','math_eval','constant_call','str_transform','dead_branch','junk_clean','vm_detect','vm_extract','base64_detect','weredev_full_decompile'],
     obfuscatePresets:   ['Minify', 'Weak', 'Medium', 'Strong'],
     obfuscateSteps:     ['SplitStrings', 'EncryptStrings', 'ConstantArray', 'ProxifyLocals', 'WrapInFunction', 'Vmify'],
   });
@@ -85,8 +85,9 @@ app.post('/api/deobfuscate', async (req, res) => {
     case 'dead_branch':     result = deadBranchRemover(code);         break;
     case 'junk_clean':      result = junkAssignmentCleaner(code);     break;
     case 'vm_detect':       result = { ...vmDetector(code), success: vmDetector(code).isVm }; break;
-    case 'vm_extract':      result = vmBytecodeExtractor(code);       break;
-    case 'base64_detect':   result = base64Detector(code, new CapturePool()); break;
+    case 'vm_extract':              result = vmBytecodeExtractor(code);              break;
+    case 'weredev_full_decompile':  result = weredevFullDecompileHandler(code);       break;
+    case 'base64_detect':           result = base64Detector(code, new CapturePool()); break;
     case 'vmify':           result = deobfuscateVmify(code);          break;
     case 'dynamic':         result = await tryDynamicExecution(code); break;
     case 'auto':
@@ -3577,6 +3578,884 @@ function obfuscateWithCustomVM(code, options = {}) {
       }
     });
   });
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  BLOCK WD: Weredev VM 完全逆コンパイルエンジン v1.0
+//
+//  対象パターン (Weredev固有):
+//    local R = {...}          → 定数プール
+//    local Z = function(i)... → 定数取得アクセサ (R[i - offset])
+//    while J do               → VMディスパッチループ
+//    if J < N then ... end    → opcodeブロック (N=閾値でopcode番号を決定)
+//
+//  処理フロー:
+//    1. extractWeredevConstPool   — R={...} 定数プール抽出
+//    2. extractWeredevZAccessor   — Z(i) = R[i-offset] のオフセット解析
+//    3. extractWeredevDispatchLoop — while J do / if J < N ブロック解析
+//    4. assignWeredevOpcodes      — 条件閾値→opcode番号マッピング
+//    5. decompileWeredevBlock     — 各opcodeブロックをLua文に変換
+//    6. reconstructWeredevLua     — 全ブロックを繋いで完全Luaコードへ
+// ════════════════════════════════════════════════════════════════════════
+
+// ────────────────────────────────────────────────────────────────────────
+//  Step 1: 定数プール抽出
+//  local R = { val1, val2, ... }  または
+//  local R = { [1]=val1, [2]=val2, ... }
+// ────────────────────────────────────────────────────────────────────────
+function extractWeredevConstPool(code) {
+  const pools = {};
+  const tableRe = /local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{/g;
+  let m;
+  while ((m = tableRe.exec(code)) !== null) {
+    const varName = m[1];
+    const startPos = m.index + m[0].length - 1;
+    let depth = 0, pos = startPos, end = -1;
+    const limit = Math.min(code.length, startPos + 2000000);
+    for (let i = startPos; i < limit; i++) {
+      if (code[i] === '{') depth++;
+      else if (code[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end === -1) continue;
+    const body = code.substring(startPos + 1, end);
+    const elements = parseConstPoolBody(body);
+    if (elements.length < 1) continue;
+    pools[varName] = {
+      name: varName, elements,
+      count: elements.length,
+      startPos: m.index, endPos: end + 1,
+      isLikelyConstPool: detectIfConstPool(elements),
+    };
+  }
+  return pools;
+}
+
+function parseConstPoolBody(body) {
+  const elements = [];
+  let i = 0, cur = '', depth = 0, inStr = false, strCh = '';
+  while (i < body.length) {
+    const c = body[i];
+    if (!inStr) {
+      if (c === '"' || c === "'") { inStr = true; strCh = c; cur += c; }
+      else if (c === '[' && body[i+1] === '[') {
+        let e = body.indexOf(']]', i + 2); if (e === -1) e = body.length - 2;
+        cur += body.substring(i, e + 2); i = e + 2; continue;
+      }
+      else if (c === '{') { depth++; cur += c; }
+      else if (c === '}') { depth--; cur += c; }
+      else if (c === ',' && depth === 0) {
+        const elem = resolveConstPoolElement(cur.trim());
+        if (elem !== undefined) elements.push(elem);
+        cur = '';
+      } else cur += c;
+    } else {
+      if (c === '\\') { cur += c + (body[i+1] || ''); i += 2; continue; }
+      if (c === strCh) inStr = false;
+      cur += c;
+    }
+    i++;
+  }
+  if (cur.trim()) { const elem = resolveConstPoolElement(cur.trim()); if (elem !== undefined) elements.push(elem); }
+  return elements;
+}
+
+function resolveConstPoolElement(tok) {
+  if (!tok) return undefined;
+  const keyValM = tok.match(/^\s*\[\s*-?\d+\s*\]\s*=\s*(.+)$/s);
+  if (keyValM) tok = keyValM[1].trim();
+  if ((tok.startsWith('"') && tok.endsWith('"')) || (tok.startsWith("'") && tok.endsWith("'"))) {
+    return { type: 'string', raw: tok, value: tok.slice(1,-1)
+      .replace(/\\n/g,'\n').replace(/\\t/g,'\t').replace(/\\r/g,'\r')
+      .replace(/\\\\/g,'\\').replace(/\\"/g,'"').replace(/\\'/g,"'")
+      .replace(/\\(\d{1,3})/g,(_,d)=>String.fromCharCode(parseInt(d)))
+      .replace(/\\x([0-9a-fA-F]{2})/g,(_,h)=>String.fromCharCode(parseInt(h,16))) };
+  }
+  if (tok.startsWith('[[') && tok.endsWith(']]')) return { type:'string', raw:tok, value:tok.slice(2,-2) };
+  if (tok === 'nil')   return { type:'nil',  raw:tok, value:null };
+  if (tok === 'true')  return { type:'bool', raw:tok, value:true };
+  if (tok === 'false') return { type:'bool', raw:tok, value:false };
+  const n = Number(tok.replace(/_/g,''));
+  if (!isNaN(n) && tok !== '') return { type:'number', raw:tok, value:n };
+  try {
+    if (/^[\d\s+\-*/().\^%]+$/.test(tok)) {
+      const v = Function('"use strict";return('+tok+')')();
+      if (typeof v==='number' && isFinite(v)) return { type:'number', raw:tok, value:v };
+    }
+  } catch {}
+  return { type:'expr', raw:tok, value:tok };
+}
+
+function detectIfConstPool(elements) {
+  if (elements.length === 0) return false;
+  if (elements.length < 4) return true; // アクセサで参照される場合は小さくても有効
+  const strCount = elements.filter(e => e && e.type === 'string').length;
+  const numCount = elements.filter(e => e && e.type === 'number').length;
+  return strCount >= 2 || numCount >= 10 || (strCount >= 1 && numCount >= 2) || elements.length >= 4;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  Step 2: Z(i) アクセサ解析
+//  local Z = function(i) return R[i - OFFSET] end
+// ────────────────────────────────────────────────────────────────────────
+function extractWeredevZAccessor(code, constPools) {
+  const accessors = {};
+  const patterns = [
+    /local\s+([A-Za-z_]\w*)\s*=\s*function\s*\(\s*([A-Za-z_]\w*)\s*\)\s*return\s+([A-Za-z_]\w*)\s*\[\s*\2\s*([\+\-])\s*(\d+)\s*\]\s*end/g,
+    /local\s+([A-Za-z_]\w*)\s*=\s*function\s*\(\s*([A-Za-z_]\w*)\s*\)\s*return\s+([A-Za-z_]\w*)\s*\[\s*\2\s*\]\s*end/g,
+    /\b([A-Za-z_]\w*)\s*=\s*function\s*\(\s*([A-Za-z_]\w*)\s*\)\s*return\s+([A-Za-z_]\w*)\s*\[\s*\2\s*([\+\-])\s*(\d+)\s*\]\s*end/g,
+  ];
+  for (const re of patterns) {
+    let m; re.lastIndex = 0;
+    while ((m = re.exec(code)) !== null) {
+      const funcName = m[1], poolName = m[3];
+      const sign = m[4] || '+', rawOffset = m[5] ? parseInt(m[5]) : 0;
+      const offset = sign === '-' ? rawOffset : -rawOffset;
+      if (constPools && (constPools[poolName] !== undefined)) {
+        accessors[funcName] = { funcName, poolName, offset, sign, raw: m[0] };
+      } else if (!constPools) {
+        accessors[funcName] = { funcName, poolName, offset, sign, raw: m[0] };
+      }
+    }
+  }
+  return accessors;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  Step 3: while J do ディスパッチループ抽出
+// ────────────────────────────────────────────────────────────────────────
+function _wdEscapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ── extractIfJBlocks ────────────────────────────────────────────────────
+// while J do の本体から  if J < N then ... end  ブロックを再帰的にフラット展開する。
+// Weredevは二分探索木形式でopcodeをディスパッチするため、ネストした if J<midpoint then
+// の葉ノードが実際のopcodeに相当する。
+// アルゴリズム:
+//   1. 現在のブロック内で最初の "if jVar <OP> N then" を見つける
+//   2. 対応する end まで本体を抽出 (depth計算)
+//   3. then/else の各ブランチを再帰処理してフラット化
+//   4. 葉ノード (内部に if jVar が存在しない) をブロックとして登録
+function extractIfJBlocks(loopBody, jVar) {
+  if (!jVar) {
+    const m = loopBody.match(/\bif\s+([A-Za-z_]\w*)\s*[<>=!]/);
+    jVar = m ? m[1] : 'J';
+  }
+  const blocks = [];
+  _flattenIfJTree(loopBody, jVar, blocks);
+  // 閾値昇順でソート
+  blocks.sort((a, b) => a.threshold - b.threshold);
+  return blocks;
+}
+
+// 再帰的にif-then-elseツリーを展開してleafブロックを収集
+function _flattenIfJTree(src, jVar, out) {
+  const ifRe = new RegExp(`\\bif\\s+${_wdEscapeRegex(jVar)}\\s*(<|<=|==|>=|>)\\s*(\\d+)\\s*then`);
+  const m = ifRe.exec(src);
+  if (!m) {
+    // if J<N が存在しない → 単独文があれば葉ノードとして収集
+    _collectLeafStatements(src, jVar, out);
+    return;
+  }
+
+  const op        = m[1];
+  const threshold = parseInt(m[2]);
+  const thenStart = m.index + m[0].length;
+
+  // if J<N より前に単独文があれば葉ノードとして収集
+  const beforeIf = src.substring(0, m.index).trim();
+  if (beforeIf.length > 5) {
+    _collectLeafStatements(beforeIf, jVar, out, threshold - 0.5); // 小数で位置保持
+  }
+
+  // then本体と else/elseif/end の境界をdepth計算で特定
+  const { thenBody, elseBody } = _splitIfThenElse(src, thenStart);
+
+  // thenブランチ: 内部に if jVar があればさらに再帰
+  const ifReThen = new RegExp(`\\bif\\s+${_wdEscapeRegex(jVar)}\\s*[<>=!]`);
+  if (ifReThen.test(thenBody)) {
+    _flattenIfJTree(thenBody, jVar, out);
+  } else if (thenBody.trim().length > 0) {
+    // 葉ノード → opcodeブロックとして登録
+    out.push({ op, threshold, body: thenBody.trim(), pos: m.index, headerLen: m[0].length });
+  }
+
+  // elseブランチ (存在すれば)
+  if (elseBody && elseBody.trim().length > 0) {
+    if (ifReThen.test(elseBody)) {
+      _flattenIfJTree(elseBody, jVar, out);
+    } else {
+      out.push({ op: '>=', threshold: threshold + 1, body: elseBody.trim(), pos: m.index + m[0].length });
+    }
+  }
+
+  // m.index より後の同レベルブロックも処理 (兄弟ノードの探索)
+  const afterIf = _findIfBlockEnd(src, m.index);
+  if (afterIf < src.length - 5) {
+    _flattenIfJTree(src.substring(afterIf), jVar, out);
+  }
+}
+
+// if J<N を含まない単純文を葉ノードとして収集
+function _collectLeafStatements(src, jVar, out, hintThreshold) {
+  const trimmed = src.trim();
+  if (!trimmed || trimmed.length < 3) return;
+  // コメントのみなら無視
+  if (/^--/.test(trimmed)) return;
+  // ifや他の制御文が含まれていれば無視
+  if (/\b(if|while|for|repeat)\b/.test(trimmed)) return;
+  // end のみも無視
+  if (/^end\s*$/.test(trimmed)) return;
+  // 有効な文として登録
+  out.push({
+    op: '<',
+    threshold: Math.round(hintThreshold || 0) + 1,
+    body: trimmed,
+    pos: -1,
+    headerLen: 0,
+    isImplicitLeaf: true,
+  });
+}
+
+// if...then...else...end の then本体 / else本体を分離
+function _splitIfThenElse(src, thenStart) {
+  let depth = 1, i = thenStart;
+  let elsePos = -1;
+  const keywords = /\b(if|while|for|repeat|do|function)\b|\b(end|until)\b|\belse(?:if)?\b/g;
+  keywords.lastIndex = thenStart;
+  let km;
+  while ((km = keywords.exec(src)) !== null) {
+    const kw = km[0];
+    if (/^(if|while|for|function|do|repeat)$/.test(kw)) {
+      depth++;
+    } else if (kw === 'end' || kw === 'until') {
+      depth--;
+      if (depth === 0) {
+        const endPos = km.index;
+        if (elsePos !== -1) {
+          return { thenBody: src.substring(thenStart, elsePos), elseBody: src.substring(elsePos + 4, endPos) };
+        }
+        return { thenBody: src.substring(thenStart, endPos), elseBody: '' };
+      }
+    } else if ((kw === 'else' || kw === 'elseif') && depth === 1) {
+      elsePos = km.index;
+    }
+  }
+  // endが見つからない場合はsrc末尾まで
+  return { thenBody: src.substring(thenStart), elseBody: '' };
+}
+
+// if...end ブロック全体の終端位置を返す
+function _findIfBlockEnd(src, ifStart) {
+  let depth = 0;
+  const keywords = /\b(if|while|for|repeat|do|function)\b|\bend\b/g;
+  keywords.lastIndex = ifStart;
+  let m;
+  while ((m = keywords.exec(src)) !== null) {
+    if (/^(if|while|for|function|do|repeat)$/.test(m[0])) depth++;
+    else if (m[0] === 'end') {
+      depth--;
+      if (depth === 0) return m.index + 3;
+    }
+  }
+  return src.length;
+}
+
+function extractWeredevDispatchLoop(code) {
+  const loops = [];
+  // while VAR do
+  const whileRe = /while\s+([A-Za-z_]\w*)\s+do\b/g;
+  let m;
+  while ((m = whileRe.exec(code)) !== null) {
+    const loopVar = m[1];
+    if (loopVar === 'true' || loopVar === '1') continue;
+    const doIdx = code.indexOf('do', m.index + m[0].length - 3);
+    if (doIdx === -1) continue;
+    let depth = 1, end = -1;
+    let scan = doIdx + 2;
+    const limit = Math.min(code.length, doIdx + 5000000);
+    while (scan < limit) {
+      const sub = code.slice(scan);
+      const doM = sub.match(/^[\s\S]*?\b(do|then|repeat)\b/);
+      const endM = sub.match(/^[\s\S]*?\bend\b/);
+      const nextDo  = sub.search(/\b(do|then|repeat)\b/);
+      const nextEnd = sub.search(/\bend\b/);
+      if (nextEnd === -1) break;
+      if (nextDo !== -1 && nextDo < nextEnd) { depth++; scan += nextDo + 2; }
+      else { depth--; if (depth === 0) { end = scan + nextEnd + 3; break; } scan += nextEnd + 3; }
+    }
+    if (end === -1) continue;
+    const loopBody = code.substring(m.index, end);
+    const dispatchBlocks = extractIfJBlocks(loopBody, loopVar);
+    if (dispatchBlocks.length < 1) continue;
+    loops.push({ loopVar, loopStart: m.index, loopEnd: end, body: loopBody, dispatchBlocks, blockCount: dispatchBlocks.length });
+  }
+  // while true do もサーチ
+  const whileTrueRe = /while\s+true\s+do\b/g;
+  while ((m = whileTrueRe.exec(code)) !== null) {
+    const snippet = code.substring(m.index, Math.min(code.length, m.index + 500000));
+    const blocks = extractIfJBlocks(snippet, null);
+    if (blocks.length >= 3) {
+      const jVarM = snippet.match(/if\s+([A-Za-z_]\w*)\s*[<>=!]/);
+      const lv = jVarM ? jVarM[1] : 'J';
+      loops.push({ loopVar: lv, loopStart: m.index, loopEnd: m.index + snippet.length,
+        body: snippet, dispatchBlocks: blocks, blockCount: blocks.length, isWhileTrue: true });
+    }
+  }
+  return loops;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  Step 4: 閾値→opcode番号マッピング
+// ────────────────────────────────────────────────────────────────────────
+function assignWeredevOpcodes(dispatchBlocks) {
+  const sortedT = [...new Set(dispatchBlocks.map(b => b.threshold))].sort((a, b) => a - b);
+  return dispatchBlocks.map((block, idx) => ({
+    ...block,
+    opcodeMin: idx === 0 ? 0 : sortedT[idx - 1],
+    opcodeMax: block.threshold - 1,
+    estimatedOpcode: sortedT[idx] !== undefined ? sortedT[idx] - 1 : idx,
+    idx,
+  }));
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  Step 5: opcodeブロック意味解析
+// ────────────────────────────────────────────────────────────────────────
+function analyzeWeredevOpcodeBlock(block, ctx) {
+  const body     = block.body;
+  const regName  = (ctx && ctx.regVar)   || 'V';
+  const pcName   = (ctx && ctx.pcVar)    || 'pc';
+  const poolName = (ctx && ctx.poolVar)  || 'R';
+  const zName    = (ctx && ctx.zFunc)    || 'Z';
+  const ops = [];
+  const rE = _wdEscapeRegex;
+
+  // MOVE/LOADK
+  const moveRe = new RegExp(
+    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*=\\s*` +
+    `(?:${rE(regName)}\\s*\\[([^\\]]+)\\]|${rE(zName)}\\s*\\(([^)]+)\\)|${rE(poolName)}\\s*\\[([^\\]]+)\\])`, 'g');
+  let mm;
+  while ((mm = moveRe.exec(body)) !== null) {
+    const dest = mm[1].trim();
+    if (mm[2])      ops.push({ kind:'MOVE',  lua:`V[${dest}] = V[${mm[2].trim()}]` });
+    else if (mm[3]) ops.push({ kind:'LOADK', lua:`V[${dest}] = Z(${mm[3].trim()})` });
+    else if (mm[4]) ops.push({ kind:'LOADK', lua:`V[${dest}] = R[${mm[4].trim()}]` });
+  }
+  // 算術
+  const arithRe = new RegExp(
+    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*=\\s*` +
+    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*([+\\-*/%^])\\s*${rE(regName)}\\s*\\[([^\\]]+)\\]`, 'g');
+  while ((mm = arithRe.exec(body)) !== null) {
+    const sym = mm[3];
+    const name = {'+':'ADD','-':'SUB','*':'MUL','/':'DIV','%':'MOD','^':'POW'}[sym]||'ARITH';
+    ops.push({ kind:name, lua:`V[${mm[1].trim()}] = V[${mm[2].trim()}] ${sym} V[${mm[4].trim()}]` });
+  }
+  // NEWTABLE
+  const ntRe = new RegExp(`${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*=\\s*\\{\\s*\\}`, 'g');
+  while ((mm = ntRe.exec(body)) !== null) ops.push({ kind:'NEWTABLE', lua:`V[${mm[1].trim()}] = {}` });
+  // GETTABLE
+  const gtRe = new RegExp(
+    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*=\\s*${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*\\[([^\\]]+)\\]`, 'g');
+  while ((mm = gtRe.exec(body)) !== null)
+    ops.push({ kind:'GETTABLE', lua:`V[${mm[1].trim()}] = V[${mm[2].trim()}][${mm[3].trim()}]` });
+  // SETTABLE
+  const stRe = new RegExp(
+    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*\\[([^\\]]+)\\]\\s*=\\s*${rE(regName)}\\s*\\[([^\\]]+)\\]`, 'g');
+  while ((mm = stRe.exec(body)) !== null)
+    ops.push({ kind:'SETTABLE', lua:`V[${mm[1].trim()}][${mm[2].trim()}] = V[${mm[3].trim()}]` });
+  // CONCAT
+  const catRe = new RegExp(
+    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*=\\s*${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*\\.\\.\\s*${rE(regName)}\\s*\\[([^\\]]+)\\]`, 'g');
+  while ((mm = catRe.exec(body)) !== null)
+    ops.push({ kind:'CONCAT', lua:`V[${mm[1].trim()}] = V[${mm[2].trim()}] .. V[${mm[3].trim()}]` });
+  // UNM/NOT/LEN
+  const unRe = new RegExp(
+    `${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*=\\s*([-#]|not\\s+)${rE(regName)}\\s*\\[([^\\]]+)\\]`, 'g');
+  while ((mm = unRe.exec(body)) !== null) {
+    const s = mm[2].trim();
+    const n = s==='-'?'UNM':s==='#'?'LEN':'NOT';
+    ops.push({ kind:n, lua:`V[${mm[1].trim()}] = ${s}V[${mm[3].trim()}]` });
+  }
+  // CALL
+  const callRe = new RegExp(`${rE(regName)}\\s*\\[([^\\]]+)\\]\\s*\\(([^)]*)\\)`, 'g');
+  while ((mm = callRe.exec(body)) !== null)
+    ops.push({ kind:'CALL', lua:`V[${mm[1].trim()}](${mm[2].trim()})` });
+  // JMP
+  const jmpRe = new RegExp(`${rE(pcName)}\\s*=\\s*${rE(pcName)}\\s*([+\\-])\\s*(\\d+)`, 'g');
+  while ((mm = jmpRe.exec(body)) !== null) {
+    const delta = mm[1]==='+'?parseInt(mm[2]):-parseInt(mm[2]);
+    ops.push({ kind:'JMP', lua:`-- jump pc${delta>=0?'+':''}${delta}`, delta });
+  }
+  // COND_JMP
+  const condRe = new RegExp(`if\\s+(?:not\\s+)?${rE(regName)}\\s*\\[([^\\]]+)\\]`, 'g');
+  while ((mm = condRe.exec(body)) !== null)
+    ops.push({ kind:'COND_JMP', lua:`if V[${mm[1].trim()}] then ... end` });
+  // RETURN
+  if (/\breturn\b/.test(body) && !/function/.test(body)) {
+    const rm = body.match(/return\s+(.+)/s);
+    ops.push({ kind:'RETURN', lua: rm ? `return ${rm[1].trim().substring(0,120).replace(/\n/g,' ')}` : 'return' });
+  }
+  // GETGLOBAL
+  const ggRe = /(?:_ENV|_G)\s*\[([^\]]+)\]/g;
+  while ((mm = ggRe.exec(body)) !== null)
+    ops.push({ kind:'GETGLOBAL', lua:`-- GETGLOBAL _G[${mm[1].trim()}]` });
+  if (ops.length === 0)
+    ops.push({ kind:'RAW', lua:`-- [raw] ${body.substring(0,120).replace(/\n/g,' ')}` });
+  return ops;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  Step 6: コンテキスト変数名の自動検出
+// ────────────────────────────────────────────────────────────────────────
+function detectWeredevContext(code) {
+  const ctx = { loopVar:'J', regVar:'V', pcVar:'pc', poolVar:'R', zFunc:'Z', instrVar:'I', stackVar:'S' };
+  // loopVar
+  const wvc = {};
+  const wRe = /\bwhile\s+([A-Za-z_]\w*)\s+do\b/g;
+  let m;
+  while ((m = wRe.exec(code)) !== null) wvc[m[1]] = (wvc[m[1]]||0) + 1;
+  delete wvc['true'];
+  const lve = Object.entries(wvc).sort((a,b)=>b[1]-a[1]);
+  if (lve.length > 0) ctx.loopVar = lve[0][0];
+  // regVar (テーブル代入頻度)
+  const tac = {};
+  const taRe = /\b([A-Za-z_]\w*)\s*\[[^\]]+\]\s*=/g;
+  while ((m = taRe.exec(code)) !== null) tac[m[1]] = (tac[m[1]]||0) + 1;
+  const rc = Object.entries(tac)
+    .filter(([k]) => k !== ctx.poolVar && !['string','table','math'].includes(k))
+    .sort((a,b)=>b[1]-a[1]);
+  if (rc.length > 0) ctx.regVar = rc[0][0];
+  // zFunc / poolVar
+  const zRe = /local\s+([A-Za-z_]\w*)\s*=\s*function\s*\([^)]+\)\s*return\s+([A-Za-z_]\w*)\s*\[/g;
+  while ((m = zRe.exec(code)) !== null) { ctx.zFunc = m[1]; ctx.poolVar = m[2]; break; }
+  // pcVar
+  const pcc = {};
+  const pcRe = /\b([A-Za-z_]\w*)\s*=\s*\1\s*\+\s*1\b/g;
+  while ((m = pcRe.exec(code)) !== null) {
+    const vn = m[1];
+    if (vn !== ctx.loopVar && vn !== ctx.regVar) pcc[vn] = (pcc[vn]||0) + 1;
+  }
+  const pce = Object.entries(pcc).sort((a,b)=>b[1]-a[1]);
+  if (pce.length > 0) ctx.pcVar = pce[0][0];
+  return ctx;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  Step 7: Z(N) 呼び出しを定数値に解決
+// ────────────────────────────────────────────────────────────────────────
+function resolveWeredevZCalls(code, accessors, constPools) {
+  if (!accessors || Object.keys(accessors).length === 0) return { code, resolved: 0 };
+  let modified = code, resolved = 0;
+  for (const [funcName, accessor] of Object.entries(accessors)) {
+    const pool = constPools[accessor.poolName];
+    if (!pool) continue;
+    const callRe = new RegExp(`\\b${_wdEscapeRegex(funcName)}\\s*\\(\\s*(\\d+)\\s*\\)`, 'g');
+    modified = modified.replace(callRe, (match, idxStr) => {
+      const idx = parseInt(idxStr);
+      // Z(i) = R[i - offset]  ここでoffsetはLuaの1-indexed基準
+      // JS配列は0-indexed なので: elements[R-index - 1]
+      // R-index = idx - offset  →  JS-index = R-index - 1 = idx - offset - 1
+      // ただしoffsetが既に「Luaインデックスの調整値」なので:
+      //   Z(i) = R[i - offset] なら R-index = i - offset, JS-index = i - offset - 1
+      const jsIdx = idx - accessor.offset - 1;
+      const elem = pool.elements[jsIdx];
+      if (!elem) return match;
+      resolved++;
+      if (elem.type === 'string') {
+        const safe = elem.value.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r');
+        return `"${safe}"`;
+      }
+      if (elem.type === 'number') return String(elem.value);
+      if (elem.type === 'bool')   return String(elem.value);
+      if (elem.type === 'nil')    return 'nil';
+      return match;
+    });
+  }
+  return { code: modified, resolved };
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  コード後処理
+// ────────────────────────────────────────────────────────────────────────
+function cleanWeredevOutputCode(code, ctx) {
+  if (!code) return '';
+  let result = code;
+  // 巨大な定数テーブル定義を圧縮 (500文字以上のリテラルテーブル)
+  result = result.replace(/local\s+[A-Za-z_]\w*\s*=\s*\{[^}]{500,}\}/gs, '-- [定数プール省略]');
+  // アクセサ関数定義を削除
+  result = result.replace(/local\s+[A-Za-z_]\w*\s*=\s*function\s*\([^)]+\)\s*return\s+[A-Za-z_]\w*\s*\[[^\]]+\]\s*end\s*/g, '');
+  result = result.replace(/\n{4,}/g, '\n\n');
+  result = result.replace(/[ \t]+$/gm, '');
+  return result.trim();
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  疑似Luaコード組み立て
+// ────────────────────────────────────────────────────────────────────────
+function buildWeredevPseudoLua(analysis, ctx, originalCode) {
+  const lines = [];
+  lines.push('-- ════════════════════════════════════════════════════════');
+  lines.push('-- Weredev VM 逆コンパイル結果 (YAJU Deobfuscator v2)');
+  lines.push('-- ════════════════════════════════════════════════════════');
+  lines.push('');
+
+  // 定数プール出力
+  for (const [name, pool] of Object.entries(analysis.constPools)) {
+    if (pool.count === 0) continue;
+    lines.push(`-- ── 定数プール: ${name} (${pool.count}要素) ────────────────────`);
+    const strings = pool.elements.filter(e => e && e.type === 'string' && e.value.length > 0).slice(0, 30);
+    if (strings.length > 0) {
+      lines.push(`--   文字列: ${strings.map(s=>`"${s.value.substring(0,40).replace(/\n/g,'\\n')}"`).join(', ')}`);
+    }
+    const nums = pool.elements.filter(e => e && e.type === 'number').slice(0, 20);
+    if (nums.length > 0) lines.push(`--   数値: ${nums.map(n=>String(n.value)).join(', ')}`);
+  }
+  if (Object.keys(analysis.constPools).length > 0) lines.push('');
+
+  // アクセサ情報
+  for (const [name, acc] of Object.entries(analysis.accessors)) {
+    lines.push(`-- アクセサ: ${name}(i) = ${acc.poolName}[i - ${acc.offset}]`);
+  }
+  if (Object.keys(analysis.accessors).length > 0) lines.push('');
+
+  // Z()解決サマリ
+  if (analysis.stats.resolvedZCalls > 0) {
+    lines.push(`-- Z()解決: ${analysis.stats.resolvedZCalls}件の定数参照を展開済み`);
+    lines.push('');
+  }
+
+  // ディスパッチループ
+  for (const loop of analysis.dispatchLoops) {
+    lines.push(`-- VMディスパッチ: while ${loop.loopVar} do  [${loop.blockCount}ブロック]`);
+  }
+  if (analysis.dispatchLoops.length > 0) lines.push('');
+
+  // opcodeブロック逆コンパイル
+  if (analysis.opcodeBlocks.length > 0) {
+    lines.push('-- ── opcodeブロック逆コンパイル ─────────────────────────────');
+    lines.push('-- 形式: [opcode番号] OPCODE_NAME  A=レジスタ B=オペランド C=オペランド');
+    lines.push('--       → vmDecompileInstruction による Lua 文');
+    lines.push('');
+    for (const block of analysis.opcodeBlocks) {
+      const opName  = block.opName || LUA51_OPCODES[block.estimatedOpcode] || `OP_${block.estimatedOpcode}`;
+      const abcInfo = [
+        block.A !== null && block.A !== undefined ? `A=${block.A}` : null,
+        block.B !== null && block.B !== undefined ? `B=${block.B}` : null,
+        block.C !== null && block.C !== undefined ? `C=${block.C}` : null,
+      ].filter(Boolean).join(' ');
+      lines.push(`-- [opcode ${String(block.estimatedOpcode).padStart(2,' ')}] ${opName.padEnd(12,' ')} ${abcInfo}  (if ${ctx.loopVar} < ${block.threshold})`);
+      // instrLua (vmDecompileInstruction 出力) を優先
+      if (block.instrLua && !/^-- OP_|^-- UNKNOWN/.test(block.instrLua)) {
+        lines.push(`  ${block.instrLua}`);
+      } else {
+        // フォールバック: analyzeWeredevOpcodeBlock の IRops
+        for (const op of block.ops) {
+          if (op.kind === 'PC_INCR' || op.kind === 'RAW') continue;
+          lines.push(`  ${op.lua}`);
+        }
+      }
+    }
+    lines.push('');
+  }
+
+  // Z()解決後のクリーンアップ済みコード
+  const resolvedCode = analysis.resolvedCode || originalCode;
+  const cleanedCode  = cleanWeredevOutputCode(resolvedCode, ctx);
+  if (cleanedCode.length > 50) {
+    lines.push('-- ── Z()解決後・クリーンアップ済みコード ──────────────────────');
+    lines.push(cleanedCode);
+  }
+
+  return lines.join('\n');
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  メインエントリ: weredevFullDecompile
+// ────────────────────────────────────────────────────────────────────────
+function weredevFullDecompile(code) {
+  const result = {
+    success:false, method:'weredev_full_decompile',
+    context:{}, constPools:{}, accessors:{}, dispatchLoops:[],
+    opcodeBlocks:[], resolvedCode:'', pseudoLua:'', error:null, stats:{},
+  };
+  if (!code || code.length === 0) { result.error = 'コードが空です'; return result; }
+
+  // フェーズ1: コンテキスト変数名検出
+  const ctx = detectWeredevContext(code);
+  result.context = ctx;
+
+  // フェーズ2: 定数プール抽出
+  const constPools = extractWeredevConstPool(code);
+  result.constPools = constPools;
+  result.stats.constPoolCount = Object.keys(constPools).length;
+  result.stats.totalConstants = Object.values(constPools).reduce((s,p)=>s+p.count,0);
+
+  // フェーズ3: Z() アクセサ解析
+  const accessors = extractWeredevZAccessor(code, constPools);
+  result.accessors = accessors;
+  result.stats.accessorCount = Object.keys(accessors).length;
+  // アクセサからコンテキスト更新
+  if (Object.keys(accessors).length > 0) {
+    const fa = Object.values(accessors)[0];
+    ctx.poolVar = fa.poolName;
+    ctx.zFunc   = fa.funcName;
+  }
+
+  // フェーズ4: ディスパッチループ抽出
+  const loops = extractWeredevDispatchLoop(code);
+  result.dispatchLoops = loops;
+  result.stats.dispatchLoopCount = loops.length;
+  result.stats.totalOpcodeBlocks = loops.reduce((s,l)=>s+l.blockCount,0);
+
+  // フェーズ5: Z(N) → 定数解決 (resolvedCodeを以降の処理でも使用)
+  const resolved = resolveWeredevZCalls(code, accessors, constPools);
+  result.resolvedCode = resolved.code;
+  result.stats.resolvedZCalls = resolved.resolved;
+
+  // フェーズ6: opcodeブロック意味解析 + vmDecompileInstruction統合
+  const allBlocks = [];
+  // 定数プールを直接参照できる形にフラット化
+  const flatPool = _buildFlatConstPool(constPools, accessors);
+
+  for (const loop of loops) {
+    const numbered = assignWeredevOpcodes(loop.dispatchBlocks);
+    for (const block of numbered) {
+      // 6a: 構造解析 (IR ops 生成)
+      const ops = analyzeWeredevOpcodeBlock(block, ctx);
+      // 6b: 精密オペランド抽出
+      const operands = extractWeredevOperands(block.body, ctx);
+      const { A, B, C } = operands;
+      // 6c: オペランドパターンから実際のopNameを逆算 (Weredevのopcode番号はシャッフルされているため)
+      const detectedOpName = _inferOpNameFromOperands(operands, block.body, ctx);
+      const opNum = block.estimatedOpcode;
+      // 6d: vmDecompileInstruction で標準Lua文を生成
+      const instrLua = vmDecompileInstruction(detectedOpName, opNum, A, B, C, LUA51_OPCODES);
+      // 6e: 定数参照を実際の値で置換
+      const instrResolved = resolveInstrConstants(instrLua, flatPool);
+
+      allBlocks.push({
+        threshold:       block.threshold,
+        estimatedOpcode: opNum,
+        opName:          detectedOpName,
+        A, B, C,
+        instrLua:        instrResolved,
+        ops,
+        rawBody:         block.body.substring(0, 300),
+      });
+    }
+  }
+  result.opcodeBlocks = allBlocks;
+  result.stats.opcodeBlocksDecompiled = allBlocks.length;
+
+  // フェーズ7: 疑似Luaコード生成
+  result.pseudoLua = buildWeredevPseudoLua(result, ctx, code);
+  result.success = result.pseudoLua.length > 50 ||
+    result.stats.totalConstants > 0 || result.stats.resolvedZCalls > 0;
+
+  return result;
+}
+
+// ── 補助: 全定数プールをフラットな配列/マップにまとめる ──────────────────
+// ── 補助: オペランドとブロック本体のパターンからopNameを推定 ─────────────
+// Weredevのopcodeマッピングはランダム化されているため、
+// LUA51_OPCODES[estimatedOpcode]は不正確。
+// ブロック本体のパターンから正確なopNameを決定する。
+function _inferOpNameFromOperands(operands, body, ctx) {
+  const rV  = (ctx && ctx.regVar) || 'V';
+  const zFn = (ctx && ctx.zFunc)  || 'Z';
+  const rE  = _wdEscapeRegex;
+  const { A, B, C, _op } = operands;
+
+  // RETURN
+  if (/\breturn\b/.test(body) && !/function/.test(body)) return 'RETURN';
+
+  // CALL: V[A](...)
+  if (body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]\\s*\\([^)]*\\)(?!\\s*[\\[.])`)) &&
+      !body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]\\s*=\\s*${rE(rV)}\\s*\\[\\d+\\]\\s*\\[`))) {
+    // 戻り値ありなら CALL_RET、なければ CALL
+    if (body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]\\s*=\\s*${rE(rV)}\\s*\\[\\d+\\]\\s*\\(`))) return 'CALL';
+    return 'CALL';
+  }
+
+  // NEWTABLE
+  if (body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]\\s*=\\s*\\{\\s*\\}`))) return 'NEWTABLE';
+
+  // 算術演算子から直接判定
+  if (_op) {
+    return {'+':'ADD','-':'SUB','*':'MUL','/':'DIV','%':'MOD','^':'POW'}[_op] || 'ADD';
+  }
+
+  // CONCAT (..)
+  if (body.includes('..')) return 'CONCAT';
+
+  // UNM: V[A] = -V[B]
+  if (body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]\\s*=\\s*-${rE(rV)}\\s*\\[\\d+\\]`))) return 'UNM';
+  // NOT
+  if (body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]\\s*=\\s*not\\s+${rE(rV)}\\s*\\[\\d+\\]`))) return 'NOT';
+  // LEN
+  if (body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]\\s*=\\s*#${rE(rV)}\\s*\\[\\d+\\]`))) return 'LEN';
+
+  // SETTABLE: V[A][key] = V[C]
+  if (body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]\\s*\\[`)) &&
+      body.match(new RegExp(`\\]\\s*=\\s*${rE(rV)}\\s*\\[`))) {
+    // 左辺が V[A][key] = の形か
+    if (body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]\\s*\\[[^\\]]+\\]\\s*=`))) return 'SETTABLE';
+  }
+
+  // GETTABLE: V[A] = V[B][...]
+  if (body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]\\s*=\\s*${rE(rV)}\\s*\\[\\d+\\]\\s*\\[`))) return 'GETTABLE';
+
+  // LOADK: V[A] = Z(B) or V[A] = R[B]
+  if (body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]\\s*=\\s*${rE(zFn)}\\s*\\(\\d+\\)`)) ||
+      body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]\\s*=\\s*[A-Za-z_]\\w*\\s*\\[\\d+\\](?!\\s*\\[)`))) {
+    // Z() or pool[] → LOADK
+    if (body.match(new RegExp(`${rE(zFn)}\\s*\\(\\d+\\)`))) return 'LOADK';
+  }
+
+  // GETGLOBAL / SETGLOBAL
+  if (body.includes('_ENV') || body.includes('_G')) {
+    if (body.match(/=\s*(?:_ENV|_G)\[/)) return 'GETGLOBAL';
+    if (body.match(/(?:_ENV|_G)\[[^\]]+\]\s*=/)) return 'SETGLOBAL';
+  }
+
+  // MOVE: V[A] = V[B]  (シンプルなレジスタ転送)
+  if (A !== null && B !== null && C === null &&
+      body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]\\s*=\\s*${rE(rV)}\\s*\\[\\d+\\](?!\\s*[+\\-*/%^\\[\\.])`))) {
+    return 'MOVE';
+  }
+
+  // JMP: pc = pc + N
+  if (body.match(/\bpc\s*=\s*pc\s*[+\-]\s*\d+/)) return 'JMP';
+
+  // 不明
+  return `OP_UNKNOWN`;
+}
+
+function _buildFlatConstPool(constPools, accessors) {
+  // アクセサごとに { funcName → [elem0, elem1, ...] (0-indexed, offset適用済み) }
+  const flat = {};
+  for (const [fn, acc] of Object.entries(accessors)) {
+    const pool = constPools[acc.poolName];
+    if (!pool) continue;
+    // Z(i) → pool.elements[i - offset - 1]  (1-indexed)
+    flat[fn] = { elements: pool.elements, offset: acc.offset };
+  }
+  return flat;
+}
+
+// ── 補助: ブロック本体からLua5.1形式のA/B/Cオペランドを推定抽出 ─────────
+function extractWeredevOperands(body, ctx) {
+  const rV   = (ctx && ctx.regVar)  || 'V';
+  const zFn  = (ctx && ctx.zFunc)   || 'Z';
+  const rE   = _wdEscapeRegex;
+  let m;
+
+  // ARITH: V[A] = V[B] OP V[C]  (MOVEより先に評価)
+  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*${rE(rV)}\\s*\\[(\\d+)\\]\\s*([+\\-*/%^])\\s*${rE(rV)}\\s*\\[(\\d+)\\]`));
+  if (m) return { A: parseInt(m[1]), B: parseInt(m[2]), C: parseInt(m[4]), _op: m[3] };
+
+  // CONCAT: V[A] = V[B] .. V[C]
+  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*${rE(rV)}\\s*\\[(\\d+)\\]\\s*\\.\\s*\\.\\s*${rE(rV)}\\s*\\[(\\d+)\\]`));
+  if (m) return { A: parseInt(m[1]), B: parseInt(m[2]), C: parseInt(m[3]) };
+
+  // GETTABLE: V[A] = V[B][V[C] or Z(x) or literal]
+  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*${rE(rV)}\\s*\\[(\\d+)\\]\\s*\\[(?:${rE(rV)}\\s*\\[(\\d+)\\]|${rE(zFn)}\\s*\\((\\d+)\\)|(\\d+))\\]`));
+  if (m) return { A: parseInt(m[1]), B: parseInt(m[2]), C: m[3]!=null?parseInt(m[3]):m[4]!=null?parseInt(m[4]):m[5]!=null?parseInt(m[5]):null };
+
+  // SETTABLE: V[A][key] = V[C]
+  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*\\[(?:${rE(rV)}\\s*\\[(\\d+)\\]|${rE(zFn)}\\s*\\((\\d+)\\))\\]\\s*=\\s*${rE(rV)}\\s*\\[(\\d+)\\]`));
+  if (m) return { A: parseInt(m[1]), B: m[2]!=null?parseInt(m[2]):m[3]!=null?parseInt(m[3]):null, C: parseInt(m[4]) };
+
+  // UNM/NOT/LEN: V[A] = -/not/# V[B]
+  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*(?:-|not\\s+|#)${rE(rV)}\\s*\\[(\\d+)\\]`));
+  if (m) return { A: parseInt(m[1]), B: parseInt(m[2]), C: null };
+
+  // LOADK: V[A] = Z(B)
+  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*${rE(zFn)}\\s*\\((\\d+)\\)`));
+  if (m) return { A: parseInt(m[1]), B: parseInt(m[2]), C: null };
+
+  // NEWTABLE: V[A] = {}
+  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*\\{\\s*\\}`));
+  if (m) return { A: parseInt(m[1]), B: 0, C: 0 };
+
+  // RETURN: return V[A], ...
+  m = body.match(new RegExp(`return\\s+${rE(rV)}\\s*\\[(\\d+)\\]`));
+  if (m) {
+    const nret = (body.match(new RegExp(`${rE(rV)}\\s*\\[\\d+\\]`, 'g')) || []).length;
+    return { A: parseInt(m[1]), B: nret + 1, C: null };
+  }
+  if (/\breturn\b/.test(body) && !/function/.test(body)) return { A: 0, B: 1, C: null };
+
+  // CALL: V[A](...)
+  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*\\(`));
+  if (m) return { A: parseInt(m[1]), B: null, C: null };
+
+  // MOVE: V[A] = V[B]  (最後 - 他パターンと誤マッチを防ぐ)
+  m = body.match(new RegExp(`${rE(rV)}\\s*\\[(\\d+)\\]\\s*=\\s*${rE(rV)}\\s*\\[(\\d+)\\](?!\\s*[+\\-*/%^\\[\\.])`));
+  if (m) return { A: parseInt(m[1]), B: parseInt(m[2]), C: null };
+
+  return { A: null, B: null, C: null };
+}
+
+// ── 補助: instrLua内の K[N] をフラット定数プールの値で置換 ──────────────
+function resolveInstrConstants(instrLua, flatPool) {
+  if (!instrLua || !flatPool) return instrLua;
+  // K[N] 形式の参照を解決 (vmDecompileInstruction出力に含まれる)
+  return instrLua.replace(/K\[(\d+)\]/g, (match, idxStr) => {
+    const idx = parseInt(idxStr);
+    // flatPoolの最初のエントリから取得
+    for (const acc of Object.values(flatPool)) {
+      const realIdx = idx - acc.offset;
+      const elem = acc.elements[realIdx - 1];
+      if (!elem) continue;
+      if (elem.type === 'string') {
+        const safe = elem.value.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n');
+        return `"${safe}"`;
+      }
+      if (elem.type === 'number') return String(elem.value);
+      if (elem.type === 'bool')   return String(elem.value);
+      if (elem.type === 'nil')    return 'nil';
+    }
+    return match; // 解決できなければそのまま
+  });
+}
+
+// APIハンドラ
+function weredevFullDecompileHandler(code) {
+  try {
+    const r = weredevFullDecompile(code);
+    const poolSummary = Object.fromEntries(
+      Object.entries(r.constPools).map(([k,v]) => [k, {
+        count: v.count,
+        isLikelyConstPool: v.isLikelyConstPool,
+        strings: v.elements.filter(e=>e&&e.type==='string').slice(0,20).map(e=>e.value.substring(0,60)),
+        numbers: v.elements.filter(e=>e&&e.type==='number').slice(0,20).map(e=>e.value),
+      }])
+    );
+    if (!r.success) {
+      return {
+        success:false, method:'weredev_full_decompile',
+        error: r.error || 'Weredev VMパターンが検出できませんでした',
+        context:r.context, stats:r.stats, constPools:poolSummary,
+      };
+    }
+    return {
+      success:true, method:'weredev_full_decompile',
+      result: r.pseudoLua,
+      resolvedCode: r.resolvedCode.length < 500000 ? r.resolvedCode : r.resolvedCode.substring(0,500000)+'...[truncated]',
+      context:r.context, stats:r.stats, constPools:poolSummary,
+      accessors:r.accessors,
+      dispatchLoops: r.dispatchLoops.map(l=>({ loopVar:l.loopVar, blockCount:l.blockCount, isWhileTrue:l.isWhileTrue||false })),
+      opcodeBlocks: r.opcodeBlocks.map(b=>({
+        threshold:b.threshold, estimatedOpcode:b.estimatedOpcode,
+        opName: LUA51_OPCODES[b.estimatedOpcode]||`OP_${b.estimatedOpcode}`,
+        ops: b.ops.map(o=>o.lua),
+      })),
+    };
+  } catch(e) {
+    return { success:false, method:'weredev_full_decompile', error:'エラー: '+e.message };
+  }
 }
 
 setInterval(() => {
