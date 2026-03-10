@@ -1,7 +1,17 @@
 // vm/weredevs/extractor.js
 'use strict';
 
-const { decodeLuaEscapes } = require('../../core/stringDecoder');
+const { decodeLuaEscapes }  = require('../../core/stringDecoder');
+const { weredevsDecode }    = require('../../utils/stringPipeline');
+
+// ────────────────────────────────────────────────────────────────────────
+//  最初の LocalStatement の変数名を動的取得
+//  固定名 ("R", "Z" など) への依存を排除する
+// ────────────────────────────────────────────────────────────────────────
+function extractFirstLocalName(code) {
+  const m = code.match(/^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)/m);
+  return m ? m[1] : null;
+}
 
 function extractVmTableNames(code) {
   const names = [];
@@ -66,7 +76,7 @@ function extractVmTable(code, vmTableName) {
 }
 
 function extractWeredevConstPool(code) {
-  // 定数プール抽出前にLua escapeをコード全体に展開
+  // 定数プール抽出前にLua escapeをコード全体へ展開
   code = decodeLuaEscapes(code);
   const pools = {};
   const tableRe = /local\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{/g;
@@ -74,7 +84,7 @@ function extractWeredevConstPool(code) {
   while ((m = tableRe.exec(code)) !== null) {
     const varName = m[1];
     const startPos = m.index + m[0].length - 1;
-    let depth = 0, pos = startPos, end = -1;
+    let depth = 0, end = -1;
     const limit = Math.min(code.length, startPos + 2000000);
     for (let i = startPos; i < limit; i++) {
       if (code[i] === '{') depth++;
@@ -119,7 +129,10 @@ function parseConstPoolBody(body) {
     }
     i++;
   }
-  if (cur.trim()) { const elem = resolveConstPoolElement(cur.trim()); if (elem !== undefined) elements.push(elem); }
+  if (cur.trim()) {
+    const elem = resolveConstPoolElement(cur.trim());
+    if (elem !== undefined) elements.push(elem);
+  }
   return elements;
 }
 
@@ -158,6 +171,44 @@ function detectIfConstPool(elements) {
   const strCount = elements.filter(e => e && e.type === 'string').length;
   const numCount = elements.filter(e => e && e.type === 'number').length;
   return strCount >= 2 || numCount >= 10 || (strCount >= 1 && numCount >= 2) || elements.length >= 4;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  R配列構築 + weredevsDecodeパイプラインを適用
+//  最初のLocalStatementの変数名を動的取得して固定名依存を排除
+// ────────────────────────────────────────────────────────────────────────
+function buildConstPoolArray(constPools, code) {
+  // 最初のLocalStatementの変数名を動的取得
+  const firstLocalName = extractFirstLocalName(code);
+
+  // constPoolsの中からR配列候補を特定
+  // 優先: 1) 最初のlocal変数名と一致  2) isLikelyConstPool=true で最大のもの
+  let poolName = null;
+  if (firstLocalName && constPools[firstLocalName]) {
+    poolName = firstLocalName;
+  } else {
+    let maxCount = 0;
+    for (const [name, pool] of Object.entries(constPools)) {
+      if (pool.isLikelyConstPool && pool.count > maxCount) {
+        maxCount = pool.count;
+        poolName = name;
+      }
+    }
+  }
+
+  if (!poolName || !constPools[poolName]) return [];
+
+  // R配列を構築
+  const R = constPools[poolName].elements.map(e => e ? e.value : null);
+
+  // R配列の全文字列要素にweredevsDecodeパイプラインを適用
+  for (let i = 0; i < R.length; i++) {
+    if (typeof R[i] === 'string') {
+      R[i] = weredevsDecode(R[i]);
+    }
+  }
+
+  return R;
 }
 
 function extractWeredevZAccessor(code, constPools) {
@@ -255,7 +306,7 @@ function _collectLeafStatements(src, jVar, out, hintThreshold) {
 }
 
 function _splitIfThenElse(src, thenStart) {
-  let depth = 1, i = thenStart;
+  let depth = 1;
   let elsePos = -1;
   const keywords = /\b(if|while|for|repeat|do|function)\b|\b(end|until)\b|\belse(?:if)?\b/g;
   keywords.lastIndex = thenStart;
@@ -371,9 +422,11 @@ function vmBytecodeExtractor(code) {
 }
 
 module.exports = {
+  extractFirstLocalName,
   extractVmTableNames, extractVmTable,
   extractWeredevConstPool, parseConstPoolBody,
   resolveConstPoolElement, detectIfConstPool,
+  buildConstPoolArray,
   extractWeredevZAccessor, _wdEscapeRegex,
   extractIfJBlocks, _flattenIfJTree, _collectLeafStatements,
   _splitIfThenElse, _findIfBlockEnd, extractWeredevDispatchLoop,
